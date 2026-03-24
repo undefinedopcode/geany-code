@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD 11)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GEANY REQUIRED geany)
 pkg_check_modules(GTK REQUIRED gtk+-3.0)
-pkg_check_modules(WEBKIT REQUIRED webkit2gtk-4.1)
+pkg_check_modules(GTKSV REQUIRED gtksourceview-4)
 pkg_check_modules(JSONGLIB REQUIRED json-glib-1.0)
 pkg_check_modules(GIO REQUIRED gio-2.0)
 
@@ -40,7 +40,7 @@ set_target_properties(geany-code PROPERTIES PREFIX "")
 target_include_directories(geany-code PRIVATE
     ${GEANY_INCLUDE_DIRS}
     ${GTK_INCLUDE_DIRS}
-    ${WEBKIT_INCLUDE_DIRS}
+    ${GTKSV_INCLUDE_DIRS}
     ${JSONGLIB_INCLUDE_DIRS}
     ${GIO_INCLUDE_DIRS}
 )
@@ -48,7 +48,7 @@ target_include_directories(geany-code PRIVATE
 target_link_libraries(geany-code PRIVATE
     ${GEANY_LIBRARIES}
     ${GTK_LIBRARIES}
-    ${WEBKIT_LIBRARIES}
+    ${GTKSV_LIBRARIES}
     ${JSONGLIB_LIBRARIES}
     ${GIO_LIBRARIES}
 )
@@ -81,5 +81,4 @@ install(TARGETS geany-code LIBRARY DESTINATION "${GEANY_PLUGIN_DIR}")
 # Install MCP server
 install(TARGETS geany-code-mcp-server RUNTIME DESTINATION bin)
 
-# Install web assets
-install(DIRECTORY data/web/ DESTINATION "${GEANY_CODE_DATA_DIR}/web")
+# Web assets no longer needed (native GTK3 rendering)
