@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# Geany project session files
+*.geany
+
+# Editor backup files
+*~
+*.bak
+*.swp
+
+# Compiled objects
+*.o
+*.so
+
+# OS files
+.DS_Store
