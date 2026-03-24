@@ -94,6 +94,24 @@ body {
     font-size: 12px;
 }
 
+.message.history {
+    opacity: 0.55;
+}
+
+.history-separator {
+    text-align: center;
+    padding: 8px 0;
+    color: var(--fg-secondary);
+    font-size: 0.85em;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+}
+
+.history-separator span {
+    background: var(--bg);
+    padding: 0 8px;
+}
+
 .message .content {
     overflow-wrap: break-word;
 }

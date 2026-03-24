@@ -31,6 +31,7 @@ add_library(geany-code SHARED
     src/cli_session.c
     src/editor_bridge.c
     src/editor_dbus.c
+    src/session_picker.c
     src/settings.c
 )
 

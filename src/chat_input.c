@@ -14,7 +14,10 @@ typedef struct {
     GtkWidget      *model_combo;
     GtkWidget      *chips_box;      /* container for image + context chips */
     GtkWidget      *cmd_menu;       /* slash command completion popup menu */
+    GtkWidget      *file_menu;      /* @ file completion popup menu */
     GList          *commands;       /* GList of CommandInfo structs */
+    GList          *project_files;  /* GList of gchar* (relative paths) */
+    gchar          *project_root;   /* absolute path to project root */
     GList          *images;         /* GList of gchar* (base64 PNG data) */
     GList          *contexts;       /* GList of ContextChunk* */
     ChatInputSendCb       send_cb;
@@ -25,6 +28,7 @@ typedef struct {
     gpointer              mode_changed_data;
     ChatInputModelChangedCb model_changed_cb;
     gpointer              model_changed_data;
+    gboolean              mode_update_internal; /* suppress callback during programmatic set */
 } ChatInputPrivate;
 
 static const gchar *INPUT_PRIV_KEY = "geany-code-input-private";
@@ -70,6 +74,7 @@ static void on_mode_combo_changed(GtkComboBox *combo, gpointer data)
     GtkWidget *vbox = GTK_WIDGET(data);
     ChatInputPrivate *priv = get_priv(vbox);
     if (!priv || !priv->mode_changed_cb) return;
+    if (priv->mode_update_internal) return;
 
     const gchar *id = gtk_combo_box_get_active_id(combo);
     if (id)
@@ -322,6 +327,81 @@ static void on_cmd_item_activate(GtkMenuItem *item, gpointer data)
     gtk_widget_grab_focus(priv->text_view);
 }
 
+/* Forward key presses from the command menu to the text buffer so the user
+ * can keep typing to narrow the filter while the popup is visible. */
+static gboolean on_cmd_menu_key_press(GtkWidget *widget, GdkEventKey *event,
+                                       gpointer data)
+{
+    GtkWidget *vbox = GTK_WIDGET(data);
+    ChatInputPrivate *priv = get_priv(vbox);
+    if (!priv) return FALSE;
+
+    guint kv = event->keyval;
+
+    /* Escape — close menu, refocus text view */
+    if (kv == GDK_KEY_Escape) {
+        gtk_menu_shell_deactivate(GTK_MENU_SHELL(widget));
+        gtk_widget_grab_focus(priv->text_view);
+        return TRUE;
+    }
+
+    /* Enter — activate the selected item */
+    if (kv == GDK_KEY_Return || kv == GDK_KEY_KP_Enter) {
+        GtkWidget *selected = gtk_menu_shell_get_selected_item(
+            GTK_MENU_SHELL(widget));
+        if (selected) {
+            gtk_menu_item_activate(GTK_MENU_ITEM(selected));
+            gtk_menu_shell_deactivate(GTK_MENU_SHELL(widget));
+        }
+        return TRUE;
+    }
+
+    /* Up/Down — let the menu handle navigation */
+    if (kv == GDK_KEY_Up || kv == GDK_KEY_Down ||
+        kv == GDK_KEY_KP_Up || kv == GDK_KEY_KP_Down)
+        return FALSE;
+
+    /* Tab — accept selected item (same as Enter) */
+    if (kv == GDK_KEY_Tab) {
+        GtkWidget *selected = gtk_menu_shell_get_selected_item(
+            GTK_MENU_SHELL(widget));
+        if (selected) {
+            gtk_menu_item_activate(GTK_MENU_ITEM(selected));
+            gtk_menu_shell_deactivate(GTK_MENU_SHELL(widget));
+        }
+        return TRUE;
+    }
+
+    /* Backspace — delete a character from the buffer */
+    if (kv == GDK_KEY_BackSpace) {
+        GtkTextMark *mark = gtk_text_buffer_get_insert(priv->buffer);
+        GtkTextIter cursor;
+        gtk_text_buffer_get_iter_at_mark(priv->buffer, &cursor, mark);
+        if (!gtk_text_iter_is_start(&cursor)) {
+            GtkTextIter prev = cursor;
+            gtk_text_iter_backward_char(&prev);
+            gtk_text_buffer_delete(priv->buffer, &prev, &cursor);
+        }
+        return TRUE;
+    }
+
+    /* Printable characters — insert into text buffer */
+    gunichar ch = gdk_keyval_to_unicode(kv);
+    if (ch && g_unichar_isprint(ch)) {
+        gchar utf8[7];
+        gint len = g_unichar_to_utf8(ch, utf8);
+        utf8[len] = '\0';
+
+        GtkTextMark *mark = gtk_text_buffer_get_insert(priv->buffer);
+        GtkTextIter cursor;
+        gtk_text_buffer_get_iter_at_mark(priv->buffer, &cursor, mark);
+        gtk_text_buffer_insert(priv->buffer, &cursor, utf8, len);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 static void show_cmd_menu(ChatInputPrivate *priv, GtkWidget *vbox,
                            const gchar *prefix)
 {
@@ -364,6 +444,8 @@ static void show_cmd_menu(ChatInputPrivate *priv, GtkWidget *vbox,
     }
 
     if (count > 0) {
+        g_signal_connect(priv->cmd_menu, "key-press-event",
+                         G_CALLBACK(on_cmd_menu_key_press), vbox);
         gtk_widget_show_all(priv->cmd_menu);
         gtk_menu_popup_at_widget(GTK_MENU(priv->cmd_menu),
                                  priv->text_view,
@@ -373,22 +455,324 @@ static void show_cmd_menu(ChatInputPrivate *priv, GtkWidget *vbox,
     }
 }
 
+/* ── @ file completion ────────────────────────────────────────────── */
+
+static const gchar *SKIP_DIRS[] = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".cache",
+    "build", "_build", ".build", "dist", "target", ".next", ".nuxt",
+    "vendor", ".tox", ".eggs", "venv", ".venv", ".mypy_cache",
+    NULL
+};
+
+static gboolean should_skip_dir(const gchar *name)
+{
+    for (const gchar **d = SKIP_DIRS; *d; d++) {
+        if (g_strcmp0(name, *d) == 0)
+            return TRUE;
+    }
+    return name[0] == '.';  /* skip hidden dirs */
+}
+
+static void scan_dir_recursive(const gchar *base, const gchar *rel_prefix,
+                                GList **out, gint depth)
+{
+    if (depth > 8)
+        return;
+
+    gchar *full = rel_prefix[0]
+        ? g_build_filename(base, rel_prefix, NULL)
+        : g_strdup(base);
+
+    GDir *dir = g_dir_open(full, 0, NULL);
+    g_free(full);
+    if (!dir)
+        return;
+
+    const gchar *name;
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        gchar *rel = rel_prefix[0]
+            ? g_build_filename(rel_prefix, name, NULL)
+            : g_strdup(name);
+        gchar *abs = g_build_filename(base, rel, NULL);
+
+        if (g_file_test(abs, G_FILE_TEST_IS_DIR)) {
+            if (!should_skip_dir(name))
+                scan_dir_recursive(base, rel, out, depth + 1);
+        } else {
+            *out = g_list_prepend(*out, rel);
+            rel = NULL;  /* ownership transferred */
+        }
+
+        g_free(abs);
+        g_free(rel);
+    }
+    g_dir_close(dir);
+}
+
+static void scan_project_files(ChatInputPrivate *priv)
+{
+    g_list_free_full(priv->project_files, g_free);
+    priv->project_files = NULL;
+
+    if (!priv->project_root)
+        return;
+
+    scan_dir_recursive(priv->project_root, "", &priv->project_files, 0);
+    priv->project_files = g_list_sort(priv->project_files,
+                                       (GCompareFunc)g_strcmp0);
+    DBG("Scanned %u project files", g_list_length(priv->project_files));
+}
+
+/* Find the @token at or before the cursor. Returns the text after '@',
+ * and sets *at_offset to the byte offset of the '@' in the buffer text.
+ * Returns NULL if no active @token found. Caller must g_free result. */
+static gchar *find_at_token(GtkTextBuffer *buffer, gint *at_offset)
+{
+    GtkTextIter cursor;
+    GtkTextMark *mark = gtk_text_buffer_get_insert(buffer);
+    gtk_text_buffer_get_iter_at_mark(buffer, &cursor, mark);
+
+    GtkTextIter start;
+    gtk_text_buffer_get_start_iter(buffer, &start);
+    gchar *text = gtk_text_buffer_get_text(buffer, &start, &cursor, FALSE);
+    if (!text)
+        return NULL;
+
+    /* Scan backwards from end to find the last '@' that isn't preceded
+     * by an alphanumeric char (i.e. it's at word boundary or start) */
+    gint len = strlen(text);
+    gint at_pos = -1;
+    for (gint i = len - 1; i >= 0; i--) {
+        if (text[i] == ' ' || text[i] == '\n' || text[i] == '\t')
+            break;  /* hit whitespace before finding @, no token */
+        if (text[i] == '@') {
+            /* @ must be at start of text or preceded by whitespace */
+            if (i == 0 || text[i - 1] == ' ' || text[i - 1] == '\n' ||
+                text[i - 1] == '\t') {
+                at_pos = i;
+            }
+            break;
+        }
+    }
+
+    if (at_pos < 0) {
+        g_free(text);
+        return NULL;
+    }
+
+    *at_offset = at_pos;
+    gchar *prefix = g_strdup(text + at_pos + 1);
+    g_free(text);
+    return prefix;
+}
+
+static void on_file_item_activate(GtkMenuItem *item, gpointer data)
+{
+    GtkWidget *vbox = GTK_WIDGET(data);
+    ChatInputPrivate *priv = get_priv(vbox);
+    if (!priv) return;
+
+    const gchar *rel_path = g_object_get_data(G_OBJECT(item), "file-path");
+    if (!rel_path) return;
+
+    /* Find the @token position and replace it */
+    gint at_offset = 0;
+    gchar *old_prefix = find_at_token(priv->buffer, &at_offset);
+    if (!old_prefix) return;
+
+    /* Get full buffer text */
+    GtkTextIter buf_start, buf_end;
+    gtk_text_buffer_get_bounds(priv->buffer, &buf_start, &buf_end);
+    gchar *full_text = gtk_text_buffer_get_text(priv->buffer,
+                                                 &buf_start, &buf_end, FALSE);
+
+    /* Build new text: [before @] + @path + [after @prefix] */
+    gint prefix_len = strlen(old_prefix);
+    gint replace_end = at_offset + 1 + prefix_len;  /* @ + prefix */
+    gchar *replacement = g_strdup_printf("@%s ", rel_path);
+
+    GString *new_text = g_string_new("");
+    g_string_append_len(new_text, full_text, at_offset);
+    g_string_append(new_text, replacement);
+    g_string_append(new_text, full_text + replace_end);
+
+    gint cursor_pos = at_offset + strlen(replacement);
+
+    gtk_text_buffer_set_text(priv->buffer, new_text->str, -1);
+
+    /* Place cursor after the inserted path */
+    GtkTextIter cursor;
+    gtk_text_buffer_get_iter_at_offset(priv->buffer, &cursor, cursor_pos);
+    gtk_text_buffer_place_cursor(priv->buffer, &cursor);
+
+    g_free(old_prefix);
+    g_free(full_text);
+    g_free(replacement);
+    g_string_free(new_text, TRUE);
+
+    gtk_widget_grab_focus(priv->text_view);
+}
+
+static gboolean file_matches_prefix(const gchar *rel_path, const gchar *prefix)
+{
+    if (!prefix || prefix[0] == '\0')
+        return TRUE;
+
+    /* Match against relative path (case-insensitive) */
+    gchar *path_lower = g_utf8_strdown(rel_path, -1);
+    gchar *prefix_lower = g_utf8_strdown(prefix, -1);
+    gboolean match = strstr(path_lower, prefix_lower) != NULL;
+    g_free(path_lower);
+    g_free(prefix_lower);
+    return match;
+}
+
+/* Forward key presses from the file menu to the text buffer so the user
+ * can keep typing to narrow the filter while the popup is visible. */
+static gboolean on_file_menu_key_press(GtkWidget *widget, GdkEventKey *event,
+                                        gpointer data)
+{
+    GtkWidget *vbox = GTK_WIDGET(data);
+    ChatInputPrivate *priv = get_priv(vbox);
+    if (!priv) return FALSE;
+
+    guint kv = event->keyval;
+
+    /* Escape — close menu, refocus text view */
+    if (kv == GDK_KEY_Escape) {
+        gtk_menu_shell_deactivate(GTK_MENU_SHELL(widget));
+        gtk_widget_grab_focus(priv->text_view);
+        return TRUE;
+    }
+
+    /* Enter — activate the selected item */
+    if (kv == GDK_KEY_Return || kv == GDK_KEY_KP_Enter) {
+        GtkWidget *selected = gtk_menu_shell_get_selected_item(
+            GTK_MENU_SHELL(widget));
+        if (selected) {
+            gtk_menu_item_activate(GTK_MENU_ITEM(selected));
+            gtk_menu_shell_deactivate(GTK_MENU_SHELL(widget));
+        }
+        return TRUE;
+    }
+
+    /* Up/Down — let the menu handle navigation */
+    if (kv == GDK_KEY_Up || kv == GDK_KEY_Down ||
+        kv == GDK_KEY_KP_Up || kv == GDK_KEY_KP_Down)
+        return FALSE;
+
+    /* Tab — accept selected item (same as Enter) */
+    if (kv == GDK_KEY_Tab) {
+        GtkWidget *selected = gtk_menu_shell_get_selected_item(
+            GTK_MENU_SHELL(widget));
+        if (selected) {
+            gtk_menu_item_activate(GTK_MENU_ITEM(selected));
+            gtk_menu_shell_deactivate(GTK_MENU_SHELL(widget));
+        }
+        return TRUE;
+    }
+
+    /* Backspace — delete a character from the buffer */
+    if (kv == GDK_KEY_BackSpace) {
+        GtkTextMark *mark = gtk_text_buffer_get_insert(priv->buffer);
+        GtkTextIter cursor;
+        gtk_text_buffer_get_iter_at_mark(priv->buffer, &cursor, mark);
+        if (!gtk_text_iter_is_start(&cursor)) {
+            GtkTextIter prev = cursor;
+            gtk_text_iter_backward_char(&prev);
+            gtk_text_buffer_delete(priv->buffer, &prev, &cursor);
+        }
+        return TRUE;
+    }
+
+    /* Printable characters — insert into text buffer */
+    gunichar ch = gdk_keyval_to_unicode(kv);
+    if (ch && g_unichar_isprint(ch)) {
+        gchar utf8[7];
+        gint len = g_unichar_to_utf8(ch, utf8);
+        utf8[len] = '\0';
+
+        GtkTextMark *mark = gtk_text_buffer_get_insert(priv->buffer);
+        GtkTextIter cursor;
+        gtk_text_buffer_get_iter_at_mark(priv->buffer, &cursor, mark);
+        gtk_text_buffer_insert(priv->buffer, &cursor, utf8, len);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void show_file_menu(ChatInputPrivate *priv, GtkWidget *vbox,
+                            const gchar *prefix)
+{
+    if (!priv->project_files) return;
+
+    if (priv->file_menu)
+        gtk_widget_destroy(priv->file_menu);
+
+    priv->file_menu = gtk_menu_new();
+    gint count = 0;
+    const gint MAX_ITEMS = 20;
+
+    for (GList *l = priv->project_files; l && count < MAX_ITEMS; l = l->next) {
+        const gchar *rel_path = l->data;
+        if (!file_matches_prefix(rel_path, prefix))
+            continue;
+
+        GtkWidget *item = gtk_menu_item_new_with_label(rel_path);
+        g_object_set_data_full(G_OBJECT(item), "file-path",
+                               g_strdup(rel_path), g_free);
+        g_signal_connect(item, "activate",
+                         G_CALLBACK(on_file_item_activate), vbox);
+        gtk_menu_shell_append(GTK_MENU_SHELL(priv->file_menu), item);
+        count++;
+    }
+
+    if (count > 0) {
+        g_signal_connect(priv->file_menu, "key-press-event",
+                         G_CALLBACK(on_file_menu_key_press), vbox);
+        gtk_widget_show_all(priv->file_menu);
+        gtk_menu_popup_at_widget(GTK_MENU(priv->file_menu),
+                                 priv->text_view,
+                                 GDK_GRAVITY_NORTH_WEST,
+                                 GDK_GRAVITY_SOUTH_WEST,
+                                 NULL);
+    }
+}
+
+/* ── Buffer change handler (slash + file completion) ─────────────── */
+
 static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data)
 {
     GtkWidget *vbox = GTK_WIDGET(data);
     ChatInputPrivate *priv = get_priv(vbox);
-    if (!priv || !priv->commands) return;
+    if (!priv) return;
 
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(buffer, &start, &end);
     gchar *text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
 
-    if (text && text[0] == '/' && !strchr(text, ' ') && !strchr(text, '\n')) {
+    /* Slash command completion */
+    if (priv->commands && text && text[0] == '/' &&
+        !strchr(text, ' ') && !strchr(text, '\n')) {
         show_cmd_menu(priv, vbox, text + 1);
     } else {
         if (priv->cmd_menu) {
             gtk_widget_destroy(priv->cmd_menu);
             priv->cmd_menu = NULL;
+        }
+    }
+
+    /* @ file completion */
+    gint at_offset = 0;
+    gchar *at_prefix = find_at_token(buffer, &at_offset);
+    if (at_prefix) {
+        show_file_menu(priv, vbox, at_prefix);
+        g_free(at_prefix);
+    } else {
+        if (priv->file_menu) {
+            gtk_widget_destroy(priv->file_menu);
+            priv->file_menu = NULL;
         }
     }
 
@@ -545,8 +929,11 @@ void chat_input_grab_focus(GtkWidget *input)
 void chat_input_set_mode(GtkWidget *input, const gchar *mode_id)
 {
     ChatInputPrivate *priv = get_priv(input);
-    if (priv && mode_id)
+    if (priv && mode_id) {
+        priv->mode_update_internal = TRUE;
         gtk_combo_box_set_active_id(GTK_COMBO_BOX(priv->mode_combo), mode_id);
+        priv->mode_update_internal = FALSE;
+    }
 }
 
 gchar *chat_input_get_mode(GtkWidget *input)
@@ -651,6 +1038,20 @@ void chat_input_set_commands(GtkWidget *input, const gchar *commands_json)
 
     g_object_unref(p);
     DBG("Loaded %u slash commands", len);
+}
+
+void chat_input_set_project_root(GtkWidget *input, const gchar *root)
+{
+    ChatInputPrivate *priv = get_priv(input);
+    if (!priv) return;
+
+    /* Skip if unchanged */
+    if (g_strcmp0(priv->project_root, root) == 0)
+        return;
+
+    g_free(priv->project_root);
+    priv->project_root = g_strdup(root);
+    scan_project_files(priv);
 }
 
 void chat_input_set_models(GtkWidget *input, const gchar *models_json)

@@ -53,6 +53,14 @@ void chat_webview_show_user_question(GtkWidget *webview,
                                      const gchar *request_id,
                                      const gchar *questions_json);
 
+/* Add a dimmed historical message (for session resume) */
+void chat_webview_add_history_message(GtkWidget *webview,
+                                      const gchar *id, const gchar *role,
+                                      const gchar *content,
+                                      const gchar *timestamp);
+/* Add a visual separator after history messages */
+void chat_webview_add_history_separator(GtkWidget *webview);
+
 /* Clear all messages */
 void chat_webview_clear(GtkWidget *webview);
 

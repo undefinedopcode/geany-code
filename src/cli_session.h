@@ -41,11 +41,17 @@ void cli_session_set_model(CLISession *session, const gchar *model_value);
 /* Gracefully interrupt the current response (keeps session alive) */
 void cli_session_interrupt(CLISession *session);
 
+/* Set session_id for resume (takes a copy). Next start() will use --resume. */
+void cli_session_set_session_id(CLISession *session, const gchar *session_id);
+
 /* Kill the process */
 void cli_session_stop(CLISession *session);
 
 /* Check if the session is active */
 gboolean cli_session_is_running(CLISession *session);
+
+/* Get the current working directory (may be NULL before first start) */
+const gchar *cli_session_get_working_dir(CLISession *session);
 
 /* ── Callbacks ───────────────────────────────────────────────────── */
 

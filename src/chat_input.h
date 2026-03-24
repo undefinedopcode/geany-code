@@ -32,6 +32,9 @@ gchar *chat_input_get_mode(GtkWidget *input);
 /* Slash command completion — commands_json is a JSON array of {name, description} */
 void chat_input_set_commands(GtkWidget *input, const gchar *commands_json);
 
+/* @ file completion — set project root to enable file scanning */
+void chat_input_set_project_root(GtkWidget *input, const gchar *root);
+
 /* Model dropdown */
 void chat_input_set_models(GtkWidget *input, const gchar *models_json);
 void chat_input_set_model(GtkWidget *input, const gchar *model_value);

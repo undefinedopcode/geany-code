@@ -634,6 +634,35 @@ function addMessage(id, role, content, timestamp, isStreaming, images) {
     scrollToBottom();
 }
 
+function addHistoryMessage(id, role, content, timestamp) {
+    const container = document.getElementById('messages');
+    const welcome = document.getElementById('welcome-screen');
+    if (welcome) welcome.style.display = 'none';
+
+    const el = document.createElement('div');
+    el.className = `message ${role} history`;
+    el.id = `msg-${id}`;
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'content';
+    contentDiv.innerHTML = renderMarkdown(content);
+
+    el.appendChild(contentDiv);
+    container.appendChild(el);
+
+    messages[id] = { role, el, contentDiv };
+    scrollToBottom();
+}
+
+function addHistorySeparator() {
+    const container = document.getElementById('messages');
+    const sep = document.createElement('div');
+    sep.className = 'history-separator';
+    sep.innerHTML = '<span>Previous conversation</span>';
+    container.appendChild(sep);
+    scrollToBottom();
+}
+
 function addMessageImage(msgId, b64Png) {
     const msg = messages[msgId];
     if (!msg) return;

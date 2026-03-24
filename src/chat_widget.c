@@ -3,9 +3,11 @@
 #include "chat_input.h"
 #include "cli_session.h"
 #include "editor_bridge.h"
+#include "session_picker.h"
 #include <string.h>
 
 typedef struct {
+    GtkWidget   *container;  /* top-level vbox, for finding parent window */
     GtkWidget   *webview;
     GtkWidget   *input;
     CLISession  *session;
@@ -24,10 +26,23 @@ static ChatWidgetPrivate *get_priv(GtkWidget *widget)
 
 static void ensure_session(ChatWidgetPrivate *priv)
 {
-    if (cli_session_is_running(priv->session))
-        return;
-
     gchar *root = editor_bridge_get_project_root();
+
+    /* Update file completion with current project root */
+    chat_input_set_project_root(priv->input, root);
+
+    if (cli_session_is_running(priv->session)) {
+        /* Restart if the project root changed (e.g. project opened after
+         * the eager start that fell back to $HOME) */
+        const gchar *cur = cli_session_get_working_dir(priv->session);
+        if (cur && root && g_strcmp0(cur, root) != 0) {
+            cli_session_stop(priv->session);
+            cli_session_start(priv->session, root);
+        }
+        g_free(root);
+        return;
+    }
+
     cli_session_start(priv->session, root);
     g_free(root);
 }
@@ -249,6 +264,58 @@ static void on_new_session_btn(GtkButton *btn, gpointer user_data)
     on_new_session(user_data);
 }
 
+/* ── Resume session ──────────────────────────────────────────────── */
+
+static void on_resume_session_btn(GtkButton *btn, gpointer user_data)
+{
+    (void)btn;
+    ChatWidgetPrivate *priv = user_data;
+
+    gchar *root = editor_bridge_get_project_root();
+    if (!root) return;
+
+    GtkWidget *toplevel = gtk_widget_get_toplevel(priv->container);
+    GtkWindow *parent = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
+
+    gchar *session_id = session_picker_run(parent, root);
+    if (!session_id) {  /* cancelled */
+        g_free(root);
+        return;
+    }
+
+    if (*session_id == '\0') {
+        /* "Start new session" chosen */
+        g_free(root);
+        g_free(session_id);
+        on_new_session(priv);
+        return;
+    }
+
+    /* Reset state (same as on_new_session) then resume */
+    on_new_session(priv);
+    cli_session_set_session_id(priv->session, session_id);
+
+    /* Load and render recent history from the JSONL file */
+    GList *history = session_load_history(root, session_id, 20);
+    for (GList *l = history; l; l = l->next) {
+        HistoryMessage *hm = l->data;
+        gchar *id = g_strdup_printf("hist_%s", hm->uuid);
+
+        chat_webview_add_history_message(priv->webview, id, hm->role,
+                                         hm->content, hm->timestamp);
+        g_hash_table_add(priv->known_msg_ids, id); /* takes ownership */
+    }
+    if (history)
+        chat_webview_add_history_separator(priv->webview);
+    history_message_list_free(history);
+
+    g_free(root);
+    g_free(session_id);
+
+    /* Start immediately with --resume */
+    ensure_session(priv);
+}
+
 /* ── Jump-to-edit callback from web view ─────────────────────────── */
 
 static void on_jump_to_edit(const gchar *file_path,
@@ -281,6 +348,7 @@ GtkWidget *chat_widget_new(void)
                                                  g_free, NULL);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    priv->container = vbox;
     g_object_set_data(G_OBJECT(vbox), CHAT_PRIV_KEY, priv);
 
     /* Header bar */
@@ -300,6 +368,13 @@ GtkWidget *chat_widget_new(void)
     /* Spacer */
     gtk_box_pack_start(GTK_BOX(header),
                        gtk_label_new(""), TRUE, TRUE, 0);
+
+    /* Resume session button (icon) */
+    GtkWidget *resume_btn = gtk_button_new_from_icon_name(
+        "document-open-recent", GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_button_set_relief(GTK_BUTTON(resume_btn), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(resume_btn, "Resume Session");
+    gtk_box_pack_start(GTK_BOX(header), resume_btn, FALSE, FALSE, 0);
 
     /* New session button (icon) */
     GtkWidget *new_btn = gtk_button_new_from_icon_name(
@@ -326,7 +401,9 @@ GtkWidget *chat_widget_new(void)
     priv->input = chat_input_new();
     gtk_box_pack_start(GTK_BOX(vbox), priv->input, FALSE, FALSE, 4);
 
-    /* Wire new session button */
+    /* Wire header buttons */
+    g_signal_connect(resume_btn, "clicked",
+                     G_CALLBACK(on_resume_session_btn), priv);
     g_signal_connect(new_btn, "clicked",
                      G_CALLBACK(on_new_session_btn), priv);
 

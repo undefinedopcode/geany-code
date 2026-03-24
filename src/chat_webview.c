@@ -312,6 +312,34 @@ void chat_webview_update_todos(GtkWidget *webview, const gchar *todos_json)
     g_free(esc);
 }
 
+void chat_webview_add_history_message(GtkWidget *webview,
+                                      const gchar *id, const gchar *role,
+                                      const gchar *content,
+                                      const gchar *timestamp)
+{
+    gchar *esc_id = js_escape(id);
+    gchar *esc_role = js_escape(role);
+    gchar *esc_content = js_escape(content);
+    gchar *esc_ts = js_escape(timestamp ? timestamp : "");
+
+    gchar *script = g_strdup_printf(
+        "addHistoryMessage('%s', '%s', '%s', '%s');",
+        esc_id, esc_role, esc_content, esc_ts);
+
+    run_js(webview, script);
+
+    g_free(script);
+    g_free(esc_id);
+    g_free(esc_role);
+    g_free(esc_content);
+    g_free(esc_ts);
+}
+
+void chat_webview_add_history_separator(GtkWidget *webview)
+{
+    run_js(webview, "addHistorySeparator();");
+}
+
 void chat_webview_clear(GtkWidget *webview)
 {
     run_js(webview, "document.getElementById('messages').innerHTML = '';"

@@ -94,6 +94,11 @@ void cli_session_free(CLISession *session)
     g_free(session);
 }
 
+const gchar *cli_session_get_working_dir(CLISession *session)
+{
+    return session->working_dir;
+}
+
 /* ── Start the claude process ────────────────────────────────────── */
 
 gboolean cli_session_start(CLISession *session, const gchar *working_dir)
@@ -362,6 +367,14 @@ void cli_session_send_message(CLISession *session, const gchar *text,
 
     g_string_free(payload, TRUE);
     g_string_free(prompt_text, TRUE);
+}
+
+/* ── Session ID setter ───────────────────────────────────────────── */
+
+void cli_session_set_session_id(CLISession *session, const gchar *session_id)
+{
+    g_free(session->session_id);
+    session->session_id = g_strdup(session_id);
 }
 
 /* ── Mode switching ───────────────────────────────────────────────── */

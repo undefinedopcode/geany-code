@@ -34,36 +34,59 @@ gchar *editor_bridge_get_project_root(void)
 
     /* Second: walk up from current file looking for VCS markers */
     const gchar *file = editor_bridge_get_current_file();
-    if (!file)
-        return g_strdup(g_get_home_dir());
+    if (file) {
+        gchar *dir = g_path_get_dirname(file);
 
-    gchar *dir = g_path_get_dirname(file);
+        static const gchar *markers[] = {
+            ".git", ".hg", ".svn",
+            "Makefile", "CMakeLists.txt", "meson.build",
+            "package.json", "Cargo.toml", "go.mod",
+            NULL
+        };
 
-    static const gchar *markers[] = {
-        ".git", ".hg", ".svn",
-        "Makefile", "CMakeLists.txt", "meson.build",
-        "package.json", "Cargo.toml", "go.mod",
-        NULL
-    };
+        while (dir && strcmp(dir, "/") != 0) {
+            for (const gchar **m = markers; *m; m++) {
+                gchar *path = g_build_filename(dir, *m, NULL);
+                gboolean exists = g_file_test(path, G_FILE_TEST_EXISTS);
+                g_free(path);
+                if (exists)
+                    return dir;
+            }
 
-    while (dir && strcmp(dir, "/") != 0) {
-        for (const gchar **m = markers; *m; m++) {
-            gchar *path = g_build_filename(dir, *m, NULL);
-            gboolean exists = g_file_test(path, G_FILE_TEST_EXISTS);
-            g_free(path);
-            if (exists)
-                return dir;
+            gchar *parent = g_path_get_dirname(dir);
+            g_free(dir);
+            dir = parent;
         }
 
-        gchar *parent = g_path_get_dirname(dir);
         g_free(dir);
-        dir = parent;
+
+        /* Fallback: directory of current file */
+        return g_path_get_dirname(file);
     }
 
-    g_free(dir);
+    /* Third: read last session from Geany's session.conf — available at
+     * startup before the project object is populated */
+    {
+        gchar *session_conf = g_build_filename(
+            g_get_user_config_dir(), "geany", "session.conf", NULL);
+        GKeyFile *kf = g_key_file_new();
+        if (g_key_file_load_from_file(kf, session_conf, G_KEY_FILE_NONE, NULL)) {
+            gchar *session_file = g_key_file_get_string(
+                kf, "project", "session_file", NULL);
+            if (session_file && *session_file) {
+                gchar *dir = g_path_get_dirname(session_file);
+                g_free(session_file);
+                g_key_file_free(kf);
+                g_free(session_conf);
+                return dir;
+            }
+            g_free(session_file);
+        }
+        g_key_file_free(kf);
+        g_free(session_conf);
+    }
 
-    /* Fallback: directory of current file */
-    return g_path_get_dirname(file);
+    return g_strdup(g_get_home_dir());
 }
 
 void editor_bridge_jump_to(const gchar *file_path,

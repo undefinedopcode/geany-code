@@ -16,6 +16,7 @@ plugin_sources = files(
   'src/chat_input.c',
   'src/cli_session.c',
   'src/editor_bridge.c',
+  'src/session_picker.c',
   'src/settings.c',
 )
 
