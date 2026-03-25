@@ -646,6 +646,18 @@ static void get_editor_font(const gchar **out_family, gint *out_size)
     *out_size = cached_size;
 }
 
+/* Propagate scroll events from embedded Scintilla widgets to the parent
+ * scrolled window so mouse-wheel scrolling works over code blocks. */
+static gboolean on_sci_scroll(GtkWidget *widget, GdkEventScroll *event,
+                               gpointer data)
+{
+    (void)data;
+    GtkWidget *parent = gtk_widget_get_ancestor(widget, GTK_TYPE_SCROLLED_WINDOW);
+    if (parent)
+        gtk_propagate_event(parent, (GdkEvent *)event);
+    return TRUE;  /* consumed — don't let Scintilla handle it */
+}
+
 static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
                                       gboolean show_line_numbers)
 {
@@ -736,6 +748,9 @@ static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
     if (line_height < 14) line_height = 14;
     gint height = MIN(line_count * line_height + 8, 400);
     gtk_widget_set_size_request(GTK_WIDGET(sci), -1, height);
+
+    /* Forward scroll events to parent so chat view scrolls freely */
+    g_signal_connect(sci, "scroll-event", G_CALLBACK(on_sci_scroll), NULL);
 
     return GTK_WIDGET(sci);
 }
