@@ -27,10 +27,17 @@ gchar *session_picker_run(GtkWindow *parent, const gchar *working_dir);
 /* ── Session history ─────────────────────────────────────────────── */
 
 typedef struct {
+    gchar *tool_id;
+    gchar *tool_name;
+    gchar *input_json;
+} HistoryToolCall;
+
+typedef struct {
     gchar *uuid;       /* message UUID from JSONL */
     gchar *role;       /* "user" or "assistant" */
     gchar *content;    /* extracted text content (no tool blocks) */
     gchar *timestamp;  /* ISO8601 timestamp, may be NULL */
+    GList *tool_calls; /* GList of HistoryToolCall* (may be NULL) */
 } HistoryMessage;
 
 void history_message_free(HistoryMessage *msg);

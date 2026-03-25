@@ -48,6 +48,8 @@ struct _CLISession {
     gpointer       commands_data;
     CLITodosCb     todos_cb;
     gpointer       todos_data;
+    CLIThinkingCb  thinking_cb;
+    gpointer       thinking_data;
     CLIErrorCb     error_cb;
     gpointer       error_data;
     CLIFinishedCb  finished_cb;
@@ -840,22 +842,38 @@ static void process_json_line(CLISession *session, const gchar *line)
             g_string_truncate(session->current_content, 0);
         }
 
-        /* Extract text from content blocks */
+        /* Extract text and thinking from content blocks */
         if (json_object_has_member(message, "content")) {
             JsonArray *content = json_object_get_array_member(message, "content");
             guint len = json_array_get_length(content);
 
-            /* Rebuild full text from all text blocks */
+            /* Rebuild full text from all text blocks, emit thinking fragments */
             GString *full_text = g_string_new("");
+            guint thinking_fragment = 0;
+            gboolean prev_was_thinking = FALSE;
             for (guint i = 0; i < len; i++) {
                 JsonObject *block = json_array_get_object_element(content, i);
                 const gchar *block_type = json_object_get_string_member(block, "type");
 
-                if (g_strcmp0(block_type, "text") == 0) {
+                if (g_strcmp0(block_type, "thinking") == 0) {
+                    const gchar *thinking = json_object_has_member(block, "thinking")
+                        ? json_object_get_string_member(block, "thinking") : NULL;
+                    if (thinking && strlen(thinking) > 0) {
+                        if (!prev_was_thinking && i > 0)
+                            thinking_fragment++;
+                        if (session->thinking_cb)
+                            session->thinking_cb(session->current_msg_id,
+                                                 thinking_fragment, thinking,
+                                                 partial, session->thinking_data);
+                        prev_was_thinking = TRUE;
+                    }
+                } else if (g_strcmp0(block_type, "text") == 0) {
+                    prev_was_thinking = FALSE;
                     const gchar *text = json_object_get_string_member(block, "text");
                     if (text)
                         g_string_append(full_text, text);
                 } else if (g_strcmp0(block_type, "tool_use") == 0 && !partial) {
+                    prev_was_thinking = FALSE;
                     /* Complete tool call */
                     const gchar *tool_id = json_object_has_member(block, "id")
                         ? json_object_get_string_member(block, "id") : "";
@@ -1311,6 +1329,13 @@ void cli_session_set_todos_callback(CLISession *session, CLITodosCb cb,
 {
     session->todos_cb = cb;
     session->todos_data = data;
+}
+
+void cli_session_set_thinking_callback(CLISession *session, CLIThinkingCb cb,
+                                       gpointer data)
+{
+    session->thinking_cb = cb;
+    session->thinking_data = data;
 }
 
 void cli_session_set_error_callback(CLISession *session, CLIErrorCb cb,

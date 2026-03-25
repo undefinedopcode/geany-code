@@ -72,6 +72,9 @@ typedef void (*CLIInitCb)(const gchar *model, const gchar *permission_mode,
 typedef void (*CLIModelsCb)(const gchar *models_json, gpointer user_data);
 typedef void (*CLICommandsCb)(const gchar *commands_json, gpointer user_data);
 typedef void (*CLITodosCb)(const gchar *todos_json, gpointer user_data);
+typedef void (*CLIThinkingCb)(const gchar *msg_id, guint fragment_index,
+                               const gchar *text, gboolean is_streaming,
+                               gpointer user_data);
 typedef void (*CLIErrorCb)(const gchar *error_msg, gpointer user_data);
 typedef void (*CLIFinishedCb)(gpointer user_data);
 
@@ -89,6 +92,8 @@ void cli_session_set_commands_callback(CLISession *session, CLICommandsCb cb,
                                        gpointer data);
 void cli_session_set_todos_callback(CLISession *session, CLITodosCb cb,
                                     gpointer data);
+void cli_session_set_thinking_callback(CLISession *session, CLIThinkingCb cb,
+                                       gpointer data);
 void cli_session_set_error_callback(CLISession *session, CLIErrorCb cb,
                                     gpointer data);
 void cli_session_set_finished_callback(CLISession *session, CLIFinishedCb cb,

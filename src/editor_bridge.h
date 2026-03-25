@@ -19,6 +19,10 @@ gchar *editor_bridge_get_selection(void);
 /* Get the project root (VCS markers or Geany project dir) */
 gchar *editor_bridge_get_project_root(void);
 
+/* Get the git root directory (walks up looking for .git).
+ * Falls back to project root if no .git found. Caller must g_free. */
+gchar *editor_bridge_get_git_root(void);
+
 /* Open a file and optionally highlight a line range */
 void editor_bridge_jump_to(const gchar *file_path,
                            gint start_line, gint end_line);

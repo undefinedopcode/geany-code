@@ -38,6 +38,11 @@ void chat_webview_add_tool_call(GtkWidget *webview,
                                 const gchar *tool_name, const gchar *input_json,
                                 const gchar *result);
 
+/* Thinking blocks (collapsible, fragmented per interruption) */
+void chat_webview_add_thinking(GtkWidget *webview,
+                               const gchar *msg_id, guint fragment_index,
+                               const gchar *text, gboolean is_streaming);
+
 /* Permission requests */
 void chat_webview_show_permission(GtkWidget *webview,
                                   const gchar *request_id,

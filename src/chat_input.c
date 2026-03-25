@@ -12,6 +12,9 @@ typedef struct {
     GtkWidget      *stop_btn;
     GtkWidget      *mode_combo;
     GtkWidget      *model_combo;
+    GtkWidget      *todos_box;      /* todo panel (above chips, shown when active) */
+    GtkWidget      *todos_revealer; /* collapsible body */
+    GtkWidget      *todos_arrow;    /* expand/collapse indicator */
     GtkWidget      *chips_box;      /* container for image + context chips */
     GtkWidget      *cmd_menu;       /* slash command completion popup menu */
     GtkWidget      *file_menu;      /* @ file completion popup menu */
@@ -139,6 +142,7 @@ static void add_image_chip(GtkWidget *vbox, ChatInputPrivate *priv,
 
     /* Create chip: [thumbnail] [x] */
     GtkWidget *chip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_style_context_add_class(gtk_widget_get_style_context(chip), "attachment-chip");
     gtk_widget_set_margin_start(chip, 2);
     gtk_widget_set_margin_end(chip, 2);
 
@@ -197,6 +201,7 @@ static void add_context_chip(GtkWidget *vbox, ChatInputPrivate *priv,
     /* Create chip: [label] [x] */
     GtkWidget *chip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
     gtk_style_context_add_class(gtk_widget_get_style_context(chip), "context-chip");
+    gtk_style_context_add_class(gtk_widget_get_style_context(chip), "attachment-chip");
     gtk_widget_set_margin_start(chip, 2);
     gtk_widget_set_margin_end(chip, 2);
 
@@ -801,6 +806,14 @@ GtkWidget *chat_input_new(void)
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     g_object_set_data_full(G_OBJECT(vbox), INPUT_PRIV_KEY, priv, g_free);
 
+    /* Todos panel (hidden until active) */
+    priv->todos_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_margin_start(priv->todos_box, 4);
+    gtk_widget_set_margin_end(priv->todos_box, 4);
+    gtk_widget_set_margin_bottom(priv->todos_box, 4);
+    gtk_widget_set_no_show_all(priv->todos_box, TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), priv->todos_box, FALSE, FALSE, 0);
+
     /* Image chips container (hidden until images are pasted) */
     priv->chips_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_margin_start(priv->chips_box, 4);
@@ -1005,6 +1018,141 @@ GList *chat_input_take_contexts(GtkWidget *input)
     update_chips_visibility(priv);
 
     return contexts;
+}
+
+static gboolean on_todos_header_click(GtkWidget *w, GdkEventButton *ev,
+                                       gpointer data)
+{
+    (void)w; (void)ev;
+    ChatInputPrivate *priv = data;
+    gboolean revealed = gtk_revealer_get_reveal_child(
+        GTK_REVEALER(priv->todos_revealer));
+    gtk_revealer_set_reveal_child(GTK_REVEALER(priv->todos_revealer), !revealed);
+    gtk_label_set_text(GTK_LABEL(priv->todos_arrow), revealed ? "\u25B6" : "\u25BC");
+    return TRUE;
+}
+
+void chat_input_update_todos(GtkWidget *input, const gchar *todos_json)
+{
+    ChatInputPrivate *priv = get_priv(input);
+    if (!priv) return;
+
+    /* Clear existing todos */
+    GList *children = gtk_container_get_children(GTK_CONTAINER(priv->todos_box));
+    for (GList *c = children; c; c = c->next)
+        gtk_widget_destroy(GTK_WIDGET(c->data));
+    g_list_free(children);
+    priv->todos_revealer = NULL;
+    priv->todos_arrow = NULL;
+
+    JsonParser *jp = json_parser_new();
+    if (!todos_json || !json_parser_load_from_data(jp, todos_json, -1, NULL)) {
+        gtk_widget_hide(priv->todos_box);
+        gtk_widget_set_no_show_all(priv->todos_box, TRUE);
+        g_object_unref(jp);
+        return;
+    }
+
+    JsonArray *arr = json_node_get_array(json_parser_get_root(jp));
+    guint n = json_array_get_length(arr);
+    if (n == 0) {
+        gtk_widget_hide(priv->todos_box);
+        gtk_widget_set_no_show_all(priv->todos_box, TRUE);
+        g_object_unref(jp);
+        return;
+    }
+
+    /* Count completed */
+    guint completed = 0;
+    for (guint i = 0; i < n; i++) {
+        JsonObject *todo = json_array_get_object_element(arr, i);
+        const gchar *status = json_object_get_string_member(todo, "status");
+        if (g_strcmp0(status, "completed") == 0) completed++;
+    }
+
+    /* Clickable header */
+    GtkWidget *header_event = gtk_event_box_new();
+    GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+
+    priv->todos_arrow = gtk_label_new("\u25BC");
+    gtk_box_pack_start(GTK_BOX(header_box), priv->todos_arrow, FALSE, FALSE, 0);
+
+    gchar *header_text = g_strdup_printf("Tasks (%u/%u)", completed, n);
+    GtkWidget *header_label = gtk_label_new(header_text);
+    gtk_label_set_xalign(GTK_LABEL(header_label), 0);
+    PangoAttrList *attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+    pango_attr_list_insert(attrs, pango_attr_scale_new(0.85));
+    gtk_label_set_attributes(GTK_LABEL(header_label), attrs);
+    pango_attr_list_unref(attrs);
+    g_free(header_text);
+    gtk_box_pack_start(GTK_BOX(header_box), header_label, TRUE, TRUE, 0);
+
+    gtk_container_add(GTK_CONTAINER(header_event), header_box);
+    g_signal_connect(header_event, "button-press-event",
+                     G_CALLBACK(on_todos_header_click), priv);
+    gtk_box_pack_start(GTK_BOX(priv->todos_box), header_event, FALSE, FALSE, 0);
+
+    /* Revealer with items */
+    priv->todos_revealer = gtk_revealer_new();
+    gtk_revealer_set_reveal_child(GTK_REVEALER(priv->todos_revealer), TRUE);
+    gtk_revealer_set_transition_type(GTK_REVEALER(priv->todos_revealer),
+        GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+
+    GtkWidget *items_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    for (guint i = 0; i < n; i++) {
+        JsonObject *todo = json_array_get_object_element(arr, i);
+        const gchar *content = json_object_get_string_member(todo, "content");
+        const gchar *status = json_object_get_string_member(todo, "status");
+
+        const gchar *icon = "\u25CB";
+        if (g_strcmp0(status, "completed") == 0) icon = "\u2713";
+        else if (g_strcmp0(status, "in_progress") == 0) icon = "\u27F3";
+
+        GtkWidget *item_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        gtk_widget_set_margin_start(item_box, 8);
+
+        GtkWidget *icon_label = gtk_label_new(icon);
+        if (g_strcmp0(status, "completed") == 0) {
+            PangoAttrList *a = pango_attr_list_new();
+            pango_attr_list_insert(a, pango_attr_foreground_new(11796, 52428, 11796));
+            gtk_label_set_attributes(GTK_LABEL(icon_label), a);
+            pango_attr_list_unref(a);
+        } else if (g_strcmp0(status, "in_progress") == 0) {
+            PangoAttrList *a = pango_attr_list_new();
+            pango_attr_list_insert(a, pango_attr_foreground_new(19532, 35980, 61166));
+            gtk_label_set_attributes(GTK_LABEL(icon_label), a);
+            pango_attr_list_unref(a);
+        }
+
+        GtkWidget *text_label = gtk_label_new(content);
+        gtk_label_set_xalign(GTK_LABEL(text_label), 0);
+        gtk_label_set_line_wrap(GTK_LABEL(text_label), TRUE);
+        gtk_label_set_max_width_chars(GTK_LABEL(text_label), 1);
+        gtk_widget_set_hexpand(text_label, TRUE);
+
+        PangoAttrList *ta = pango_attr_list_new();
+        pango_attr_list_insert(ta, pango_attr_scale_new(0.85));
+        if (g_strcmp0(status, "completed") == 0) {
+            pango_attr_list_insert(ta, pango_attr_strikethrough_new(TRUE));
+            pango_attr_list_insert(ta, pango_attr_foreground_alpha_new(32768));
+        }
+        gtk_label_set_attributes(GTK_LABEL(text_label), ta);
+        pango_attr_list_unref(ta);
+
+        gtk_box_pack_start(GTK_BOX(item_box), icon_label, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(item_box), text_label, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(items_box), item_box, FALSE, FALSE, 0);
+    }
+
+    gtk_container_add(GTK_CONTAINER(priv->todos_revealer), items_box);
+    gtk_box_pack_start(GTK_BOX(priv->todos_box), priv->todos_revealer, FALSE, FALSE, 0);
+
+    gtk_widget_set_no_show_all(priv->todos_box, FALSE);
+    gtk_widget_show_all(priv->todos_box);
+
+    g_object_unref(jp);
 }
 
 void chat_input_set_commands(GtkWidget *input, const gchar *commands_json)

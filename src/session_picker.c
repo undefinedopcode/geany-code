@@ -258,6 +258,16 @@ GList *session_discover(const gchar *working_dir)
 
 /* ── Session history loading ─────────────────────────────────────── */
 
+static void history_tool_call_free(gpointer p)
+{
+    HistoryToolCall *tc = p;
+    if (!tc) return;
+    g_free(tc->tool_id);
+    g_free(tc->tool_name);
+    g_free(tc->input_json);
+    g_free(tc);
+}
+
 void history_message_free(HistoryMessage *msg)
 {
     if (!msg) return;
@@ -265,6 +275,7 @@ void history_message_free(HistoryMessage *msg)
     g_free(msg->role);
     g_free(msg->content);
     g_free(msg->timestamp);
+    g_list_free_full(msg->tool_calls, history_tool_call_free);
     g_free(msg);
 }
 
@@ -320,6 +331,54 @@ static gchar *extract_text_content(JsonObject *msg)
     }
 
     return NULL;
+}
+
+/* Extract tool_use blocks from a message's content array.
+ * Returns a GList of HistoryToolCall* (caller frees). */
+static GList *extract_tool_calls(JsonObject *msg)
+{
+    if (!msg || !json_object_has_member(msg, "content"))
+        return NULL;
+
+    JsonNode *content_node = json_object_get_member(msg, "content");
+    if (!JSON_NODE_HOLDS_ARRAY(content_node))
+        return NULL;
+
+    JsonArray *arr = json_node_get_array(content_node);
+    guint n = json_array_get_length(arr);
+    GList *result = NULL;
+
+    for (guint i = 0; i < n; i++) {
+        JsonNode *el = json_array_get_element(arr, i);
+        if (!JSON_NODE_HOLDS_OBJECT(el)) continue;
+        JsonObject *block = json_node_get_object(el);
+        if (!json_object_has_member(block, "type")) continue;
+
+        const gchar *btype = json_object_get_string_member(block, "type");
+        if (g_strcmp0(btype, "tool_use") != 0) continue;
+
+        const gchar *tid = json_object_has_member(block, "id")
+            ? json_object_get_string_member(block, "id") : "";
+        const gchar *tname = json_object_has_member(block, "name")
+            ? json_object_get_string_member(block, "name") : "unknown";
+
+        gchar *input_str = NULL;
+        if (json_object_has_member(block, "input")) {
+            JsonGenerator *gen = json_generator_new();
+            json_generator_set_root(gen,
+                json_object_get_member(block, "input"));
+            input_str = json_generator_to_data(gen, NULL);
+            g_object_unref(gen);
+        }
+
+        HistoryToolCall *tc = g_new0(HistoryToolCall, 1);
+        tc->tool_id = g_strdup(tid);
+        tc->tool_name = g_strdup(tname);
+        tc->input_json = input_str ? input_str : g_strdup("");
+        result = g_list_append(result, tc);
+    }
+
+    return result;
 }
 
 GList *session_load_history(const gchar *working_dir,
@@ -392,7 +451,11 @@ GList *session_load_history(const gchar *working_dir,
 
         JsonObject *msg = json_object_get_object_member(obj, "message");
         gchar *text = extract_text_content(msg);
-        if (!text)
+        GList *tools = (g_strcmp0(role, "assistant") == 0)
+            ? extract_tool_calls(msg) : NULL;
+
+        /* Skip if no text and no tool calls */
+        if (!text && !tools)
             continue;
 
         /* Extract UUID */
@@ -418,6 +481,7 @@ GList *session_load_history(const gchar *working_dir,
         hm->role = g_strdup(role);
         hm->content = text;
         hm->timestamp = timestamp;
+        hm->tool_calls = tools;
         g_ptr_array_add(msgs, hm);
     }
 

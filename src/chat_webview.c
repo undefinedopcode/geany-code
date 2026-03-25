@@ -1,13 +1,15 @@
 /*
  * chat_webview.c — Native GTK3 chat renderer (replaces WebKit2GTK)
  *
- * Uses GtkListBox + GtkLabel (Pango markup) + GtkSourceView for
+ * Uses GtkListBox + GtkLabel (Pango markup) + Scintilla for
  * a cross-platform chat view with no web engine dependency.
  */
 
 #include "chat_webview.h"
 #include "editor_dbus.h"
-#include <gtksourceview/gtksource.h>
+#include "plugin.h"
+#include <Scintilla.h>
+#include <ScintillaWidget.h>
 #include <json-glib/json-glib.h>
 #include <string.h>
 
@@ -34,6 +36,17 @@ typedef struct {
 } ToolEntry;
 
 typedef struct {
+    gchar       *key;           /* "msg_id:fragment_index" */
+    GtkWidget   *row;
+    GtkWidget   *arrow_label;
+    GtkWidget   *revealer;
+    GtkWidget   *body_box;
+    GtkWidget   *content_label;
+    gboolean     expanded;
+    gchar       *last_text;     /* for diff-based skip */
+} ThinkingEntry;
+
+typedef struct {
     GtkWidget   *scroll;
     GtkWidget   *outer_box;
     GtkWidget   *list_box;
@@ -41,6 +54,7 @@ typedef struct {
     GtkWidget   *todos_box;
     GHashTable  *msg_widgets;    /* id → MessageEntry* */
     GHashTable  *tool_widgets;   /* tool_id → ToolEntry* */
+    GHashTable  *thinking_widgets; /* "msg_id:fragment" → ThinkingEntry* */
     ChatWebViewPermissionCb permission_cb;
     gpointer    permission_data;
     ChatWebViewJumpToEditCb jump_cb;
@@ -76,6 +90,14 @@ static void free_tool_entry(gpointer p)
     g_free(e);
 }
 
+static void free_thinking_entry(gpointer p)
+{
+    ThinkingEntry *e = p;
+    g_free(e->key);
+    g_free(e->last_text);
+    g_free(e);
+}
+
 /* ── Auto-scroll ─────────────────────────────────────────────────── */
 
 static gboolean do_scroll_to_bottom(gpointer data)
@@ -90,7 +112,9 @@ static void scroll_to_bottom(ChatViewPrivate *priv)
 {
     GtkAdjustment *adj = gtk_scrolled_window_get_vadjustment(
         GTK_SCROLLED_WINDOW(priv->scroll));
+    /* Use idle + short timeout to ensure layout is complete before scrolling */
     g_idle_add(do_scroll_to_bottom, adj);
+    g_timeout_add(50, do_scroll_to_bottom, adj);
 }
 
 /* ── Markdown → Pango conversion ─────────────────────────────────── */
@@ -174,6 +198,158 @@ static GList *split_segments(const gchar *content)
     return segs;
 }
 
+/* Forward declaration */
+static void get_editor_font(const gchar **out_family, gint *out_size);
+
+/* Process inline markdown formatting within a line (already escaped) */
+static void process_inline(GString *out, const gchar *line)
+{
+    const gchar *p = line;
+    while (*p) {
+        /* Strikethrough: ~~text~~ */
+        if (p[0] == '~' && p[1] == '~') {
+            const gchar *end = strstr(p + 2, "~~");
+            if (end) {
+                g_string_append(out, "<s>");
+                process_inline(out, g_strndup(p + 2, end - (p + 2)));
+                g_string_append(out, "</s>");
+                p = end + 2;
+                continue;
+            }
+        }
+        /* Bold: **text** */
+        if (p[0] == '*' && p[1] == '*') {
+            const gchar *end = strstr(p + 2, "**");
+            if (end) {
+                g_string_append(out, "<b>");
+                /* Recurse for nested italic inside bold */
+                gchar *inner = g_strndup(p + 2, end - (p + 2));
+                process_inline(out, inner);
+                g_free(inner);
+                g_string_append(out, "</b>");
+                p = end + 2;
+                continue;
+            }
+        }
+        /* Italic: *text* (but not **) */
+        if (p[0] == '*' && p[1] != '*') {
+            const gchar *end = strchr(p + 1, '*');
+            if (end && end != p + 1) {
+                g_string_append(out, "<i>");
+                g_string_append_len(out, p + 1, end - (p + 1));
+                g_string_append(out, "</i>");
+                p = end + 1;
+                continue;
+            }
+        }
+        /* Inline code: `text` — with dimmed background, editor font, padding */
+        if (p[0] == '`' && p[1] != '`') {
+            const gchar *end = strchr(p + 1, '`');
+            if (end) {
+                const gchar *ff = NULL;
+                gint fs = 0;
+                get_editor_font(&ff, &fs);
+                gint code_size = fs > 2 ? fs - 2 : fs;
+                g_string_append_printf(out,
+                    "<span background=\"#00000040\" font_family=\"%s\" "
+                    "font_size=\"%dpt\">"
+                    "\u2009",  /* thin space padding left */
+                    ff, code_size);
+                g_string_append_len(out, p + 1, end - (p + 1));
+                g_string_append(out, "\u2009</span>");  /* thin space padding right */
+                p = end + 1;
+                continue;
+            }
+        }
+        /* Link: [text](url) */
+        if (p[0] == '[') {
+            const gchar *close = strchr(p + 1, ']');
+            if (close && close[1] == '(') {
+                const gchar *url_end = strchr(close + 2, ')');
+                if (url_end) {
+                    gchar *text_part = g_strndup(p + 1, close - (p + 1));
+                    gchar *url_part = g_strndup(close + 2, url_end - (close + 2));
+                    g_string_append_printf(out,
+                        "<a href=\"%s\">%s</a>", url_part, text_part);
+                    g_free(text_part);
+                    g_free(url_part);
+                    p = url_end + 1;
+                    continue;
+                }
+            }
+        }
+
+        g_string_append_c(out, *p);
+        p++;
+    }
+}
+
+/* Get the visual length of text with markdown formatting stripped */
+static gint visual_len(const gchar *text)
+{
+    gint len = 0;
+    const gchar *p = text;
+    while (*p) {
+        if (p[0] == '~' && p[1] == '~') {
+            const gchar *end = strstr(p + 2, "~~");
+            if (end) { len += visual_len(g_strndup(p + 2, end - (p + 2))); p = end + 2; continue; }
+        }
+        if (p[0] == '*' && p[1] == '*') {
+            const gchar *end = strstr(p + 2, "**");
+            if (end) { len += visual_len(g_strndup(p + 2, end - (p + 2))); p = end + 2; continue; }
+        }
+        if (p[0] == '*' && p[1] != '*') {
+            const gchar *end = strchr(p + 1, '*');
+            if (end && end != p + 1) { len += (gint)(end - (p + 1)); p = end + 1; continue; }
+        }
+        if (p[0] == '`' && p[1] != '`') {
+            const gchar *end = strchr(p + 1, '`');
+            if (end) { len += (gint)(end - (p + 1)); p = end + 1; continue; }
+        }
+        len++;
+        p = g_utf8_next_char(p);
+    }
+    return len;
+}
+
+/* Split a table row "| a | b | c |" into cells (trimmed). Returns GPtrArray of gchar*. */
+static GPtrArray *split_table_row(const gchar *line)
+{
+    GPtrArray *cells = g_ptr_array_new_with_free_func(g_free);
+    const gchar *p = line;
+
+    /* Skip leading | */
+    if (*p == '|') p++;
+
+    while (*p) {
+        const gchar *pipe = strchr(p, '|');
+        if (!pipe) {
+            gchar *cell = g_strstrip(g_strdup(p));
+            if (strlen(cell) > 0)
+                g_ptr_array_add(cells, cell);
+            else
+                g_free(cell);
+            break;
+        }
+        gchar *cell = g_strstrip(g_strndup(p, pipe - p));
+        g_ptr_array_add(cells, cell);
+        p = pipe + 1;
+    }
+
+    return cells;
+}
+
+/* Check if a line is a table separator (|---|---|) */
+static gboolean is_table_separator(const gchar *line)
+{
+    if (line[0] != '|') return FALSE;
+    for (const gchar *c = line + 1; *c; c++) {
+        if (*c != '-' && *c != '|' && *c != ':' && *c != ' ')
+            return FALSE;
+    }
+    return TRUE;
+}
+
 /* Convert a subset of markdown to Pango markup */
 static gchar *md_to_pango(const gchar *text)
 {
@@ -182,12 +358,35 @@ static gchar *md_to_pango(const gchar *text)
     GString *out = g_string_new("");
 
     gchar **lines = g_strsplit(escaped, "\n", -1);
+    gboolean in_blockquote = FALSE;
 
     for (gchar **lp = lines; *lp; lp++) {
         const gchar *line = *lp;
 
         if (out->len > 0)
             g_string_append_c(out, '\n');
+
+        /* Horizontal rule: --- or *** or ___ (3+ chars, possibly with spaces) */
+        {
+            const gchar *s = line;
+            while (*s == ' ') s++;
+            if ((g_str_has_prefix(s, "---") || g_str_has_prefix(s, "***") ||
+                 g_str_has_prefix(s, "___"))) {
+                gboolean is_rule = TRUE;
+                gchar ch = s[0];
+                for (const gchar *c = s; *c; c++) {
+                    if (*c != ch && *c != ' ') { is_rule = FALSE; break; }
+                }
+                if (is_rule && strlen(s) >= 3) {
+                    g_string_append(out,
+                        "<span foreground=\"#666666\">\u2500\u2500\u2500\u2500"
+                        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+                        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+                        "</span>");
+                    continue;
+                }
+            }
+        }
 
         /* Headings */
         if (g_str_has_prefix(line, "### ")) {
@@ -206,69 +405,136 @@ static gchar *md_to_pango(const gchar *text)
             continue;
         }
 
-        /* Bullet lists */
-        if (g_str_has_prefix(line, "- ") || g_str_has_prefix(line, "* ")) {
-            g_string_append(out, "  \u2022 ");
-            line += 2;
+        /* Blockquotes: > text (can be multi-line) */
+        if (g_str_has_prefix(line, "&gt; ") || g_strcmp0(line, "&gt;") == 0) {
+            /* Note: > was escaped to &gt; by g_markup_escape_text */
+            const gchar *content = strlen(line) > 5 ? line + 5 : "";
+            g_string_append(out,
+                "  <span foreground=\"#888888\">\u2502 </span>"
+                "<span foreground=\"#aaaaaa\"><i>");
+            process_inline(out, content);
+            g_string_append(out, "</i></span>");
+            in_blockquote = TRUE;
+            continue;
+        }
+        in_blockquote = FALSE;
+
+        /* Nested bullet lists — count leading spaces for indentation */
+        {
+            gint indent = 0;
+            const gchar *s = line;
+            while (*s == ' ') { indent++; s++; }
+
+            if (g_str_has_prefix(s, "- ") || g_str_has_prefix(s, "* ")) {
+                /* Each 2 spaces of indent = one nesting level */
+                gint level = indent / 2;
+                for (gint i = 0; i <= level; i++)
+                    g_string_append(out, "  ");
+                g_string_append(out, "\u2022 ");
+                process_inline(out, s + 2);
+                continue;
+            }
+
+            /* Numbered lists — handle nesting */
+            if (*s >= '0' && *s <= '9') {
+                const gchar *d = s;
+                while (*d >= '0' && *d <= '9') d++;
+                if (d[0] == '.' && d[1] == ' ') {
+                    gint level = indent / 2;
+                    for (gint i = 0; i <= level; i++)
+                        g_string_append(out, "  ");
+                    g_string_append_len(out, s, d - s + 1);
+                    g_string_append_c(out, ' ');
+                    process_inline(out, d + 2);
+                    continue;
+                }
+            }
         }
 
-        /* Process inline formatting within the line */
-        const gchar *p = line;
-        while (*p) {
-            /* Bold: **text** */
-            if (p[0] == '*' && p[1] == '*') {
-                const gchar *end = strstr(p + 2, "**");
-                if (end) {
-                    g_string_append(out, "<b>");
-                    g_string_append_len(out, p + 2, end - (p + 2));
-                    g_string_append(out, "</b>");
-                    p = end + 2;
-                    continue;
+        /* Table: collect all consecutive | rows, compute column widths, render */
+        if (line[0] == '|') {
+            /* Collect all table rows starting from current line */
+            GPtrArray *table_rows = g_ptr_array_new();  /* GPtrArray of GPtrArray of gchar* */
+            GArray *is_sep_row = g_array_new(FALSE, FALSE, sizeof(gboolean));
+            gint num_cols = 0;
+
+            for (gchar **tp = lp; *tp && (*tp)[0] == '|'; tp++) {
+                gboolean sep = is_table_separator(*tp);
+                g_array_append_val(is_sep_row, sep);
+                if (!sep) {
+                    GPtrArray *cells = split_table_row(*tp);
+                    if ((gint)cells->len > num_cols)
+                        num_cols = cells->len;
+                    g_ptr_array_add(table_rows, cells);
+                } else {
+                    g_ptr_array_add(table_rows, NULL);  /* placeholder for separator */
                 }
             }
-            /* Italic: *text* (but not **) */
-            if (p[0] == '*' && p[1] != '*') {
-                const gchar *end = strchr(p + 1, '*');
-                if (end && end != p + 1) {
-                    g_string_append(out, "<i>");
-                    g_string_append_len(out, p + 1, end - (p + 1));
-                    g_string_append(out, "</i>");
-                    p = end + 1;
-                    continue;
+
+            /* Calculate max visual width per column */
+            gint *col_widths = g_new0(gint, num_cols);
+            for (guint r = 0; r < table_rows->len; r++) {
+                GPtrArray *cells = g_ptr_array_index(table_rows, r);
+                if (!cells) continue;  /* separator row */
+                for (guint c = 0; c < cells->len && (gint)c < num_cols; c++) {
+                    gint vlen = visual_len(g_ptr_array_index(cells, c));
+                    if (vlen > col_widths[c])
+                        col_widths[c] = vlen;
                 }
             }
-            /* Inline code: `text` */
-            if (p[0] == '`' && p[1] != '`') {
-                const gchar *end = strchr(p + 1, '`');
-                if (end) {
-                    g_string_append(out, "<tt>");
-                    g_string_append_len(out, p + 1, end - (p + 1));
-                    g_string_append(out, "</tt>");
-                    p = end + 1;
-                    continue;
-                }
-            }
-            /* Link: [text](url) */
-            if (p[0] == '[') {
-                const gchar *close = strchr(p + 1, ']');
-                if (close && close[1] == '(') {
-                    const gchar *url_end = strchr(close + 2, ')');
-                    if (url_end) {
-                        gchar *text_part = g_strndup(p + 1, close - (p + 1));
-                        gchar *url_part = g_strndup(close + 2, url_end - (close + 2));
-                        g_string_append_printf(out,
-                            "<a href=\"%s\">%s</a>", url_part, text_part);
-                        g_free(text_part);
-                        g_free(url_part);
-                        p = url_end + 1;
-                        continue;
+
+            /* Render each row */
+            for (guint r = 0; r < table_rows->len; r++) {
+                if (r > 0) g_string_append_c(out, '\n');
+
+                gboolean sep = g_array_index(is_sep_row, gboolean, r);
+                if (sep) {
+                    /* Separator: draw ─ characters */
+                    g_string_append(out,
+                        "<span foreground=\"#666666\" font_family=\"monospace\">");
+                    for (gint c = 0; c < num_cols; c++) {
+                        if (c > 0) g_string_append(out, "\u2500\u253C\u2500");
+                        for (gint w = 0; w < col_widths[c] + 2; w++)
+                            g_string_append(out, "\u2500");
                     }
+                    g_string_append(out, "</span>");
+                } else {
+                    GPtrArray *cells = g_ptr_array_index(table_rows, r);
+                    g_string_append(out, "<tt>");
+                    for (gint c = 0; c < num_cols; c++) {
+                        if (c > 0)
+                            g_string_append(out,
+                                " <span foreground=\"#666666\">\u2502</span> ");
+                        const gchar *cell = (cells && (guint)c < cells->len)
+                            ? g_ptr_array_index(cells, c) : "";
+                        gint vlen = visual_len(cell);
+                        gint pad = col_widths[c] - vlen;
+
+                        process_inline(out, cell);
+                        for (gint p = 0; p < pad; p++)
+                            g_string_append_c(out, ' ');
+                    }
+                    g_string_append(out, "</tt>");
                 }
             }
 
-            g_string_append_c(out, *p);
-            p++;
+            /* Advance lp past all table rows */
+            guint table_len = table_rows->len;
+            for (guint r = 0; r < table_rows->len; r++) {
+                GPtrArray *cells = g_ptr_array_index(table_rows, r);
+                if (cells) g_ptr_array_free(cells, TRUE);
+            }
+            g_ptr_array_free(table_rows, TRUE);
+            g_array_free(is_sep_row, TRUE);
+            g_free(col_widths);
+
+            /* Skip past the rows we consumed (lp will be incremented by the for loop) */
+            lp += table_len - 1;
+            continue;
         }
+
+        /* Regular line — process inline formatting */
+        process_inline(out, line);
     }
 
     g_strfreev(lines);
@@ -276,67 +542,202 @@ static gchar *md_to_pango(const gchar *text)
     return g_string_free(out, FALSE);
 }
 
-/* ── GtkSourceView helper ────────────────────────────────────────── */
+/* ── Scintilla code block helper (uses Geany's highlighting theme) ── */
+
+/* Map common language hints to Geany filetype names */
+static GeanyFiletype *detect_filetype(const gchar *lang_hint,
+                                       const gchar *file_path)
+{
+    /* Try filename first */
+    if (file_path) {
+        GeanyFiletype *ft = filetypes_detect_from_file(file_path);
+        if (ft && ft->id != GEANY_FILETYPES_NONE)
+            return ft;
+    }
+
+    if (!lang_hint || strlen(lang_hint) == 0)
+        return NULL;
+
+    /* Try direct lookup */
+    GeanyFiletype *ft = filetypes_lookup_by_name(lang_hint);
+    if (ft) return ft;
+
+    /* Map common markdown fence hints to Geany filetype names */
+    static const struct { const gchar *hint; const gchar *ft_name; } map[] = {
+        {"c", "C"}, {"cpp", "C++"}, {"c++", "C++"}, {"cxx", "C++"},
+        {"h", "C"}, {"hpp", "C++"},
+        {"python", "Python"}, {"py", "Python"},
+        {"javascript", "Javascript"}, {"js", "Javascript"},
+        {"typescript", "Javascript"}, {"ts", "Javascript"},
+        {"go", "Go"}, {"golang", "Go"},
+        {"rust", "Rust"}, {"rs", "Rust"},
+        {"java", "Java"},
+        {"ruby", "Ruby"}, {"rb", "Ruby"},
+        {"lua", "Lua"},
+        {"sh", "Sh"}, {"bash", "Sh"}, {"zsh", "Sh"}, {"shell", "Sh"},
+        {"html", "HTML"}, {"xml", "XML"}, {"svg", "XML"},
+        {"css", "CSS"}, {"scss", "CSS"},
+        {"json", "JSON"},
+        {"yaml", "YAML"}, {"yml", "YAML"},
+        {"toml", "Conf"},
+        {"sql", "SQL"},
+        {"markdown", "Markdown"}, {"md", "Markdown"},
+        {"makefile", "Make"}, {"cmake", "CMake"},
+        {"dockerfile", "Dockerfile"},
+        {"diff", "Diff"}, {"patch", "Diff"},
+        {"php", "PHP"},
+        {"perl", "Perl"}, {"pl", "Perl"},
+        {"r", "R"},
+        {"swift", "Swift"},
+        {"kotlin", "Kotlin"}, {"kt", "Kotlin"},
+        {"scala", "Scala"},
+        {"haskell", "Haskell"}, {"hs", "Haskell"},
+        {NULL, NULL}
+    };
+
+    gchar *lower = g_ascii_strdown(lang_hint, -1);
+    for (gint i = 0; map[i].hint; i++) {
+        if (g_strcmp0(lower, map[i].hint) == 0) {
+            g_free(lower);
+            return filetypes_lookup_by_name(map[i].ft_name);
+        }
+    }
+    g_free(lower);
+    return NULL;
+}
+
+/* Read editor font from geany.conf (cached after first call) */
+static void get_editor_font(const gchar **out_family, gint *out_size)
+{
+    static gchar *cached_family = NULL;
+    static gint cached_size = 0;
+    static gboolean loaded = FALSE;
+
+    if (!loaded) {
+        loaded = TRUE;
+        gchar *conf = g_build_filename(
+            g_get_user_config_dir(), "geany", "geany.conf", NULL);
+        GKeyFile *kf = g_key_file_new();
+        if (g_key_file_load_from_file(kf, conf, G_KEY_FILE_NONE, NULL)) {
+            gchar *font = g_key_file_get_string(kf, "geany", "editor_font", NULL);
+            if (font) {
+                /* Parse "Font Name Size" — last space-separated token is size */
+                gchar *last_space = g_strrstr(font, " ");
+                if (last_space) {
+                    cached_size = atoi(last_space + 1);
+                    cached_family = g_strndup(font, last_space - font);
+                } else {
+                    cached_family = g_strdup(font);
+                    cached_size = 11;
+                }
+                g_free(font);
+            }
+        }
+        g_key_file_free(kf);
+        g_free(conf);
+
+        if (!cached_family)
+            cached_family = g_strdup("Monospace");
+        if (cached_size <= 0)
+            cached_size = 11;
+    }
+
+    *out_family = cached_family;
+    *out_size = cached_size;
+}
 
 static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
                                       gboolean show_line_numbers)
 {
-    GtkSourceLanguageManager *lm = gtk_source_language_manager_get_default();
-    GtkSourceLanguage *lang = NULL;
+    ScintillaObject *sci = SCINTILLA(scintilla_object_new());
 
-    if (lang_hint && strlen(lang_hint) > 0)
-        lang = gtk_source_language_manager_get_language(lm, lang_hint);
+    /* Apply Geany's active color scheme.
+     * First apply a "base" language (C) to get the editor's default
+     * background/foreground, then apply the actual language on top. */
+    GeanyFiletype *base_ft = filetypes_lookup_by_name("C");
+    if (base_ft)
+        highlighting_set_styles(sci, base_ft);
 
-    GtkSourceBuffer *buf = gtk_source_buffer_new(NULL);
-    if (lang)
-        gtk_source_buffer_set_language(buf, lang);
-    gtk_source_buffer_set_highlight_syntax(buf, TRUE);
-    gtk_text_buffer_set_text(GTK_TEXT_BUFFER(buf), code, -1);
+    /* Capture the default bg/fg from the base scheme */
+    gint default_bg = scintilla_send_message(sci, SCI_STYLEGETBACK,
+        STYLE_DEFAULT, 0);
+    gint default_fg = scintilla_send_message(sci, SCI_STYLEGETFORE,
+        STYLE_DEFAULT, 0);
 
-    /* Try to use a dark scheme */
-    GtkSourceStyleSchemeManager *sm = gtk_source_style_scheme_manager_get_default();
-    GtkSourceStyleScheme *scheme = gtk_source_style_scheme_manager_get_scheme(sm, "oblivion");
-    if (!scheme)
-        scheme = gtk_source_style_scheme_manager_get_scheme(sm, "classic-dark");
-    if (scheme)
-        gtk_source_buffer_set_style_scheme(buf, scheme);
+    GeanyFiletype *ft = detect_filetype(lang_hint, NULL);
+    if (ft && ft != base_ft)
+        highlighting_set_styles(sci, ft);
 
-    GtkWidget *view = gtk_source_view_new_with_buffer(buf);
-    g_object_unref(buf);
+    if (!ft || (lang_hint == NULL)) {
+        /* No language / plain text: reset all styles to default colors
+         * so no syntax highlighting leaks through from the base "C" scheme */
+        for (gint s = 0; s <= STYLE_MAX; s++) {
+            scintilla_send_message(sci, SCI_STYLESETFORE, s, default_fg);
+            scintilla_send_message(sci, SCI_STYLESETBACK, s, default_bg);
+            scintilla_send_message(sci, SCI_STYLESETBOLD, s, 0);
+            scintilla_send_message(sci, SCI_STYLESETITALIC, s, 0);
+        }
+    } else if (g_strcmp0(lang_hint, "diff") == 0) {
+        /* For diff: restore the default background so it matches the editor,
+         * but keep the syntax-colored foregrounds */
+        scintilla_send_message(sci, SCI_STYLESETBACK, STYLE_DEFAULT, default_bg);
+        for (gint s = 0; s <= 6; s++) {
+            scintilla_send_message(sci, SCI_STYLESETBACK, s, default_bg);
+        }
+    }
 
-    gtk_source_view_set_show_line_numbers(GTK_SOURCE_VIEW(view), show_line_numbers);
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(view), FALSE);
-    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(view), FALSE);
-    gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
-    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_WORD_CHAR);
-    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(view), 6);
-    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(view), 6);
-    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(view), 4);
-    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(view), 4);
+    /* Set content */
+    scintilla_send_message(sci, SCI_SETTEXT, 0, (sptr_t)(code ? code : ""));
 
-    /* Size: count lines for reasonable height, but let it expand naturally
-     * if wrapping causes more visual lines */
-    gint line_count = gtk_text_buffer_get_line_count(GTK_TEXT_BUFFER(buf));
-    gint height = MIN(line_count * 18 + 12, 400);
-    gtk_widget_set_size_request(view, -1, height);
+    /* Read-only */
+    scintilla_send_message(sci, SCI_SETREADONLY, 1, 0);
 
-    return view;
-}
+    /* Line numbers */
+    if (show_line_numbers) {
+        gint line_count = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
+        gint digits = 1;
+        gint n = line_count;
+        while (n >= 10) { digits++; n /= 10; }
+        gint margin_width = scintilla_send_message(sci, SCI_TEXTWIDTH,
+            STYLE_LINENUMBER, (sptr_t)"9") * (digits + 1) + 4;
+        scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 0, margin_width);
+    } else {
+        scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 0, 0);
+    }
 
-/* ── Offset line number gutter renderer ───────────────────────────── */
+    /* Hide other margins (markers, fold) */
+    scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 1, 0);
+    scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 2, 0);
 
-static void on_gutter_query_data(GtkSourceGutterRenderer *renderer,
-                                 GtkTextIter *start, GtkTextIter *end,
-                                 GtkSourceGutterRendererState state,
-                                 gpointer user_data)
-{
-    (void)end; (void)state;
-    gint offset = GPOINTER_TO_INT(user_data);
-    gint line = gtk_text_iter_get_line(start) + offset;
-    gchar *text = g_strdup_printf("%d", line);
-    gtk_source_gutter_renderer_text_set_text(
-        GTK_SOURCE_GUTTER_RENDERER_TEXT(renderer), text, -1);
-    g_free(text);
+    /* Word wrap */
+    scintilla_send_message(sci, SCI_SETWRAPMODE, SC_WRAP_WORD, 0);
+
+    /* No scrollbars — we want it to size to content */
+    scintilla_send_message(sci, SCI_SETHSCROLLBAR, 0, 0);
+    scintilla_send_message(sci, SCI_SETVSCROLLBAR, 0, 0);
+
+    /* No caret */
+    scintilla_send_message(sci, SCI_SETCARETSTYLE, CARETSTYLE_INVISIBLE, 0);
+
+    /* Apply editor font to ALL styles (must be done last, after
+     * highlighting_set_styles which sets per-style fonts) */
+    const gchar *font_family = NULL;
+    gint font_size = 0;
+    get_editor_font(&font_family, &font_size);
+    gint chat_font_size = font_size > 2 ? font_size - 2 : font_size;
+    for (gint s = 0; s <= STYLE_MAX; s++) {
+        scintilla_send_message(sci, SCI_STYLESETFONT, s, (sptr_t)font_family);
+        scintilla_send_message(sci, SCI_STYLESETSIZE, s, chat_font_size);
+    }
+
+    /* Size based on line count (recalc after font change) */
+    gint line_count = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
+    gint line_height = scintilla_send_message(sci, SCI_TEXTHEIGHT, 0, 0);
+    if (line_height < 14) line_height = 14;
+    gint height = MIN(line_count * line_height + 8, 400);
+    gtk_widget_set_size_request(GTK_WIDGET(sci), -1, height);
+
+    return GTK_WIDGET(sci);
 }
 
 /* Parse numbered line content: strip "  N→" or "  N\t" prefixes.
@@ -388,65 +789,221 @@ static gchar *strip_line_numbers(const gchar *content, gint *start_line)
     return g_string_free(out, FALSE);
 }
 
-/* Create a source view with offset line numbers in the gutter.
- * If start_line == 1, just use built-in line numbers. */
+/* Create a source view for read results — no line numbers, just highlighted code */
 static GtkWidget *create_source_view_with_offset(const gchar *code,
                                                    const gchar *lang_id,
                                                    gint start_line)
 {
-    if (start_line <= 1) {
-        /* No offset needed — use built-in line numbers */
-        return create_source_view(code, lang_id, TRUE);
-    }
-
-    /* Build the source view with custom offset gutter */
-    GtkWidget *view = create_source_view(code, lang_id, FALSE);
-
-    GtkSourceGutter *gutter = gtk_source_view_get_gutter(
-        GTK_SOURCE_VIEW(view), GTK_TEXT_WINDOW_LEFT);
-
-    GtkSourceGutterRenderer *renderer = gtk_source_gutter_renderer_text_new();
-    gtk_source_gutter_renderer_set_alignment_mode(renderer,
-        GTK_SOURCE_GUTTER_RENDERER_ALIGNMENT_MODE_FIRST);
-    gtk_source_gutter_renderer_set_visible(renderer, TRUE);
-
-    /* Calculate width based on max line number digits */
-    gint line_count = gtk_text_buffer_get_line_count(
-        gtk_text_view_get_buffer(GTK_TEXT_VIEW(view)));
-    gint max_line = start_line + line_count;
-    gint digits = 1;
-    gint n = max_line;
-    while (n >= 10) { digits++; n /= 10; }
-    gtk_source_gutter_renderer_set_size(renderer, digits * 10 + 12);
-    gtk_source_gutter_renderer_set_padding(renderer, 4, 0);
-
-    g_signal_connect(renderer, "query-data",
-                     G_CALLBACK(on_gutter_query_data),
-                     GINT_TO_POINTER(start_line));
-
-    gtk_source_gutter_insert(gutter, renderer, 0);
-    g_object_unref(renderer);
-
-    return view;
+    (void)start_line;
+    return create_source_view(code, lang_id, FALSE);
 }
 
-/* Create a source view using filename-based language detection */
+/* Create a source view using filename-based language detection.
+ * Delegates to create_source_view so font/style is consistent. */
 static GtkWidget *create_source_view_for_file(const gchar *code,
                                                const gchar *file_path,
                                                gboolean show_line_numbers)
 {
-    GtkSourceLanguageManager *lm = gtk_source_language_manager_get_default();
-    GtkSourceLanguage *lang = NULL;
+    /* Detect filetype from filename, use its name as the language hint */
+    GeanyFiletype *ft = file_path ? filetypes_detect_from_file(file_path) : NULL;
+    const gchar *lang = (ft && ft->name) ? ft->name : NULL;
+    return create_source_view(code, lang, show_line_numbers);
+}
 
-    if (file_path) {
-        gchar *content_type = g_content_type_guess(file_path, NULL, 0, NULL);
-        lang = gtk_source_language_manager_guess_language(lm, file_path, content_type);
-        g_free(content_type);
+/* Create a unified diff view: removed lines then added lines in one block,
+ * language-highlighted, with red/green line background markers. */
+static GtkWidget *create_diff_source_view(const gchar *old_s,
+                                           const gchar *new_s,
+                                           const gchar *file_path)
+{
+    /* Build unified content: removed lines first, then added lines */
+    gchar **old_lines = old_s ? g_strsplit(old_s, "\n", -1) : NULL;
+    gchar **new_lines = new_s ? g_strsplit(new_s, "\n", -1) : NULL;
+    guint n_old = old_lines ? g_strv_length(old_lines) : 0;
+    guint n_new = new_lines ? g_strv_length(new_lines) : 0;
+
+    GString *buf = g_string_new("");
+    for (guint i = 0; i < n_old; i++) {
+        if (buf->len > 0) g_string_append_c(buf, '\n');
+        g_string_append(buf, old_lines[i]);
+    }
+    for (guint i = 0; i < n_new; i++) {
+        if (buf->len > 0) g_string_append_c(buf, '\n');
+        g_string_append(buf, new_lines[i]);
     }
 
-    /* Fall back to create_source_view with the language ID */
-    const gchar *lang_id = lang ? gtk_source_language_get_id(lang) : NULL;
-    return create_source_view(code, lang_id, show_line_numbers);
+    GtkWidget *sv = create_source_view_for_file(buf->str, file_path, FALSE);
+    ScintillaObject *sci = SCINTILLA(sv);
+
+    scintilla_send_message(sci, SCI_SETREADONLY, 0, 0);
+
+    /* Marker 0 = removed (red), Marker 1 = added (green) */
+    scintilla_send_message(sci, SCI_MARKERDEFINE, 0, SC_MARK_BACKGROUND);
+    scintilla_send_message(sci, SCI_MARKERSETBACK, 0, 0x5555CC); /* red (BGR) */
+    scintilla_send_message(sci, SCI_MARKERSETALPHA, 0, 40);
+
+    scintilla_send_message(sci, SCI_MARKERDEFINE, 1, SC_MARK_BACKGROUND);
+    scintilla_send_message(sci, SCI_MARKERSETBACK, 1, 0x55CC55); /* green (BGR) */
+    scintilla_send_message(sci, SCI_MARKERSETALPHA, 1, 40);
+
+    /* Apply markers to lines */
+    for (guint i = 0; i < n_old; i++)
+        scintilla_send_message(sci, SCI_MARKERADD, i, 0);
+    for (guint i = 0; i < n_new; i++)
+        scintilla_send_message(sci, SCI_MARKERADD, n_old + i, 1);
+
+    scintilla_send_message(sci, SCI_SETREADONLY, 1, 0);
+
+    g_strfreev(old_lines);
+    g_strfreev(new_lines);
+    g_string_free(buf, TRUE);
+
+    return sv;
+}
+
+/* Forward declaration — defined further down after CSS setup */
+static void on_jump_btn_clicked(GtkButton *btn, gpointer data);
+
+/* ── Grep result rendering ────────────────────────────────────────── */
+
+/* A group of grep matches within a single file */
+typedef struct {
+    gchar  *file_path;
+    GArray *line_nums;   /* gint */
+    GString *content;    /* concatenated matched lines */
+} GrepFileGroup;
+
+/* Try to parse a line as "file:linenum:content".
+ * Returns TRUE if parsed, sets *out_file, *out_line, *out_content.
+ * The caller must NOT free out_file/out_content — they point into the line. */
+static gboolean parse_grep_line(const gchar *line,
+                                const gchar **out_file, gint *out_line,
+                                const gchar **out_content)
+{
+    /* Find first colon — file path portion */
+    const gchar *c1 = strchr(line, ':');
+    if (!c1 || c1 == line) return FALSE;
+
+    /* Second colon after a number */
+    const gchar *p = c1 + 1;
+    if (*p < '0' || *p > '9') return FALSE;
+    gint num = 0;
+    while (*p >= '0' && *p <= '9') { num = num * 10 + (*p - '0'); p++; }
+    if (*p != ':') return FALSE;
+
+    *out_file = line;      /* file path ends at c1 */
+    *out_line = num;
+    *out_content = p + 1;  /* content after second colon */
+    return TRUE;
+}
+
+/* Build a widget tree from grep output: groups matches by file, shows
+ * file path headers and syntax-highlighted code for each group. */
+static GtkWidget *render_grep_result(const gchar *result,
+                                     ChatViewPrivate *priv)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    /* Parse lines and group by file */
+    gchar **lines = g_strsplit(result, "\n", -1);
+    GPtrArray *groups = g_ptr_array_new();
+    GrepFileGroup *cur = NULL;
+
+    for (gchar **lp = lines; *lp; lp++) {
+        const gchar *line = *lp;
+
+        /* Skip separators ("--") between context groups */
+        if (g_strcmp0(line, "--") == 0) continue;
+        /* Skip empty lines */
+        if (line[0] == '\0') continue;
+
+        const gchar *fpath, *content;
+        gint linenum;
+
+        if (parse_grep_line(line, &fpath, &linenum, &content)) {
+            /* Check if same file as current group (compare up to first colon) */
+            gsize flen = (gsize)(strchr(line, ':') - line);
+            if (!cur || strncmp(cur->file_path, fpath, flen) != 0
+                     || cur->file_path[flen] != '\0') {
+                /* Start new group */
+                cur = g_new0(GrepFileGroup, 1);
+                cur->file_path = g_strndup(fpath, flen);
+                cur->line_nums = g_array_new(FALSE, FALSE, sizeof(gint));
+                cur->content = g_string_new("");
+                g_ptr_array_add(groups, cur);
+            }
+            g_array_append_val(cur->line_nums, linenum);
+            if (cur->content->len > 0)
+                g_string_append_c(cur->content, '\n');
+            g_string_append(cur->content, content);
+        } else {
+            /* Not file:line:content — might be a plain file path (files_with_matches mode)
+             * or other unstructured output. Show as-is. */
+            GtkWidget *lbl = gtk_label_new(line);
+            gtk_label_set_xalign(GTK_LABEL(lbl), 0);
+            gtk_label_set_selectable(GTK_LABEL(lbl), TRUE);
+            PangoFontDescription *mono = pango_font_description_from_string("monospace 10");
+            gtk_widget_override_font(lbl, mono);
+            pango_font_description_free(mono);
+            gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 0);
+        }
+    }
+    g_strfreev(lines);
+
+    /* Render each file group */
+    for (guint i = 0; i < groups->len; i++) {
+        GrepFileGroup *grp = g_ptr_array_index(groups, i);
+
+        /* File header — clickable "Jump to file" style */
+        GtkWidget *file_btn = gtk_button_new_with_label(grp->file_path);
+        gtk_button_set_relief(GTK_BUTTON(file_btn), GTK_RELIEF_NONE);
+        gtk_widget_set_halign(file_btn, GTK_ALIGN_START);
+
+        /* Style the label inside the button */
+        GtkWidget *btn_label = gtk_bin_get_child(GTK_BIN(file_btn));
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        pango_attr_list_insert(attrs,
+            pango_attr_foreground_new(0x5555, 0x9999, 0xdddd)); /* blueish */
+        gtk_label_set_attributes(GTK_LABEL(btn_label), attrs);
+        pango_attr_list_unref(attrs);
+
+        if (priv && priv->jump_cb) {
+            g_object_set_data_full(G_OBJECT(file_btn), "file",
+                g_strdup(grp->file_path), g_free);
+            g_object_set_data(G_OBJECT(file_btn), "priv", priv);
+            g_signal_connect(file_btn, "clicked",
+                G_CALLBACK(on_jump_btn_clicked), NULL);
+        }
+        gtk_box_pack_start(GTK_BOX(box), file_btn, FALSE, FALSE, 0);
+
+        /* Build content with line number prefixes */
+        GString *numbered = g_string_new("");
+        gchar **clines = g_strsplit(grp->content->str, "\n", -1);
+        for (guint j = 0; clines[j]; j++) {
+            gint lnum = (j < grp->line_nums->len)
+                ? g_array_index(grp->line_nums, gint, j) : 0;
+            if (numbered->len > 0)
+                g_string_append_c(numbered, '\n');
+            g_string_append_printf(numbered, "%5d %s", lnum, clines[j]);
+        }
+        g_strfreev(clines);
+
+        /* Syntax-highlighted code block */
+        GtkWidget *sv = create_source_view_for_file(
+            numbered->str, grp->file_path, FALSE);
+        g_string_free(numbered, TRUE);
+        gtk_box_pack_start(GTK_BOX(box), sv, FALSE, FALSE, 0);
+
+        /* Clean up */
+        g_free(grp->file_path);
+        g_array_free(grp->line_nums, TRUE);
+        g_string_free(grp->content, TRUE);
+        g_free(grp);
+    }
+    g_ptr_array_free(groups, TRUE);
+
+    return box;
 }
 
 /* ── Render message content (markdown → widgets) ─────────────────── */
@@ -485,6 +1042,11 @@ static void render_content(GtkWidget *content_box, const gchar *content,
             gtk_label_set_line_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
             gtk_label_set_xalign(GTK_LABEL(label), 0);
             gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+            /* Slightly increase line spacing for readability */
+            PangoAttrList *line_attrs = pango_attr_list_new();
+            pango_attr_list_insert(line_attrs, pango_attr_line_height_new(1.4));
+            gtk_label_set_attributes(GTK_LABEL(label), line_attrs);
+            pango_attr_list_unref(line_attrs);
             gtk_widget_set_halign(label, GTK_ALIGN_FILL);
             gtk_widget_set_hexpand(label, FALSE);
             /* Force label to wrap within allocated width */
@@ -525,6 +1087,8 @@ static gboolean is_bash_tool(const gchar *n)
 { return n && (g_strcmp0(n,"Bash")==0 || strstr(n,"bash")!=NULL || strstr(n,"Bash")!=NULL); }
 static gboolean is_glob_tool(const gchar *n)
 { return n && (g_strcmp0(n,"Glob")==0 || strstr(n,"glob")!=NULL); }
+static gboolean is_grep_tool(const gchar *n)
+{ return n && (g_strcmp0(n,"Grep")==0 || strstr(n,"grep")!=NULL); }
 
 /* Get display name for tool */
 static const gchar *tool_display_name(const gchar *name)
@@ -535,6 +1099,7 @@ static const gchar *tool_display_name(const gchar *name)
     if (is_read_tool(name)) return "Read";
     if (is_bash_tool(name)) return "Bash";
     if (is_glob_tool(name)) return "Glob";
+    if (is_grep_tool(name)) return "Grep";
     return name;
 }
 
@@ -582,6 +1147,12 @@ static const gchar *base_css =
     ".tool-status-running { color: @theme_selected_bg_color; }\n"
     ".tool-status-success { color: #2ecc71; }\n"
     ".tool-status-error { color: #e74c3c; }\n"
+    ".thinking-border { border: 1px solid alpha(@insensitive_fg_color, 0.3); "
+    "  border-radius: 6px; margin-top: 4px; margin-bottom: 4px; }\n"
+    ".thinking-header { padding: 4px 10px; }\n"
+    ".thinking-header:hover { background: alpha(@theme_fg_color, 0.06); }\n"
+    ".thinking-body { padding: 6px 10px; }\n"
+    ".thinking-label { color: @insensitive_fg_color; font-style: italic; }\n"
     ".perm-btn { padding: 4px 12px; }\n"
     ".perm-card { padding: 10px; border: 2px solid @theme_selected_bg_color; "
     "  border-radius: 8px; background: alpha(@theme_selected_bg_color, 0.06); }\n"
@@ -597,9 +1168,22 @@ static const gchar *base_css =
     "@keyframes blink { 50% { opacity: 0; } }\n"
     ".welcome-title { font-size: x-large; font-weight: bold; }\n"
     ".welcome-sub { font-size: small; color: @insensitive_fg_color; }\n"
+    ".attachment-chip { border: 1px solid @borders; border-radius: 6px; "
+    "  padding: 2px 4px; }\n"
     ;
 
 /* ── Widget construction ─────────────────────────────────────────── */
+
+/* Constrain content width to viewport — prevents horizontal overflow */
+static void on_scroll_size_allocate(GtkWidget *widget, GdkRectangle *alloc,
+                                    gpointer data)
+{
+    GtkWidget *outer_box = GTK_WIDGET(data);
+    /* Leave room for scrollbar (~16px) */
+    gint content_width = alloc->width - 16;
+    if (content_width < 100) content_width = 100;
+    gtk_widget_set_size_request(outer_box, content_width, -1);
+}
 
 GtkWidget *chat_webview_new(void)
 {
@@ -608,6 +1192,8 @@ GtkWidget *chat_webview_new(void)
         g_str_hash, g_str_equal, g_free, free_message_entry);
     priv->tool_widgets = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, free_tool_entry);
+    priv->thinking_widgets = g_hash_table_new_full(
+        g_str_hash, g_str_equal, g_free, free_thinking_entry);
 
     /* Load CSS */
     priv->css = gtk_css_provider_new();
@@ -652,6 +1238,10 @@ GtkWidget *chat_webview_new(void)
     gtk_box_pack_end(GTK_BOX(priv->outer_box), priv->todos_box, FALSE, FALSE, 0);
 
     gtk_container_add(GTK_CONTAINER(priv->scroll), priv->outer_box);
+
+    /* Track container width to constrain content */
+    g_signal_connect(priv->scroll, "size-allocate",
+                     G_CALLBACK(on_scroll_size_allocate), priv->outer_box);
 
     g_object_set_data_full(G_OBJECT(priv->scroll), PRIV_KEY, priv, g_free);
 
@@ -802,23 +1392,19 @@ void chat_webview_add_tool_call(GtkWidget *webview,
                 gint start_line = 1;
                 gchar *stripped = strip_line_numbers(result, &start_line);
 
-                /* Detect language from file path */
-                GtkSourceLanguageManager *lm = gtk_source_language_manager_get_default();
-                GtkSourceLanguage *lang = NULL;
-                if (existing->file_path) {
-                    gchar *ct = g_content_type_guess(existing->file_path, NULL, 0, NULL);
-                    lang = gtk_source_language_manager_guess_language(
-                        lm, existing->file_path, ct);
-                    g_free(ct);
-                }
-                const gchar *lang_id = lang ? gtk_source_language_get_id(lang) : NULL;
+                /* Detect language from file path via Geany filetypes */
+                GeanyFiletype *ft = existing->file_path
+                    ? filetypes_detect_from_file(existing->file_path) : NULL;
+                const gchar *lang_id = ft ? ft->name : NULL;
 
                 result_widget = create_source_view_with_offset(
                     stripped, lang_id, start_line);
                 g_free(stripped);
             } else if (is_bash_tool(existing->tool_name)) {
-                /* Bash output in monospace source view (sh language) */
-                result_widget = create_source_view(result, "sh", FALSE);
+                /* Bash output as plain monospace text */
+                result_widget = create_source_view(result, NULL, FALSE);
+            } else if (is_grep_tool(existing->tool_name)) {
+                result_widget = render_grep_result(result, priv);
             } else {
                 /* Default: plain label */
                 GtkWidget *res_label = gtk_label_new(result);
@@ -853,8 +1439,7 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     te->tool_id = g_strdup(tool_id);
     te->tool_name = g_strdup(tool_name);
     te->file_path = file_path;
-    te->expanded = is_edit_tool(tool_name) || is_write_tool(tool_name) ||
-                   is_read_tool(tool_name) || is_bash_tool(tool_name);
+    te->expanded = is_edit_tool(tool_name) || is_write_tool(tool_name);
 
     const gchar *display = tool_display_name(tool_name);
 
@@ -927,26 +1512,12 @@ void chat_webview_add_tool_call(GtkWidget *webview,
                ? json_object_get_string_member(input_obj, "new_text") : NULL);
 
         if (old_s && new_s) {
-            /* Simple diff display using GtkSourceView with diff language */
-            GString *diff = g_string_new("");
-            if (file_path) {
-                g_string_append_printf(diff, "--- %s\n+++ %s\n", file_path, file_path);
-            }
-            /* Split into lines and show removed/added */
-            gchar **old_lines = g_strsplit(old_s, "\n", -1);
-            gchar **new_lines = g_strsplit(new_s, "\n", -1);
-            for (gchar **l = old_lines; *l; l++)
-                g_string_append_printf(diff, "-%s\n", *l);
-            for (gchar **l = new_lines; *l; l++)
-                g_string_append_printf(diff, "+%s\n", *l);
-            g_strfreev(old_lines);
-            g_strfreev(new_lines);
-
-            GtkWidget *sv = create_source_view(diff->str, "diff", FALSE);
+            /* Unified diff block: removed lines (red bg) then added (green bg),
+             * all language-highlighted from the file extension */
+            GtkWidget *sv = create_diff_source_view(old_s, new_s, file_path);
             gtk_box_pack_start(GTK_BOX(te->body_box), sv, FALSE, FALSE, 0);
-            g_string_free(diff, TRUE);
 
-            /* Jump to file link — use data on the button + generic handler */
+            /* Jump to file link */
             if (file_path && priv->jump_cb) {
                 GtkWidget *jump_btn = gtk_button_new_with_label("Jump to file");
                 gtk_button_set_relief(GTK_BUTTON(jump_btn), GTK_RELIEF_NONE);
@@ -962,14 +1533,14 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     } else if (is_write_tool(tool_name) && input_obj &&
                json_object_has_member(input_obj, "content")) {
         const gchar *wcontent = json_object_get_string_member(input_obj, "content");
-        /* Use GtkSourceLanguageManager to guess from filename */
+        /* Detect language from filename via Geany filetypes */
         GtkWidget *sv = create_source_view_for_file(wcontent, file_path, TRUE);
         gtk_box_pack_start(GTK_BOX(te->body_box), sv, FALSE, FALSE, 0);
     } else if (is_bash_tool(tool_name) && input_obj &&
                json_object_has_member(input_obj, "command")) {
         const gchar *cmd = json_object_get_string_member(input_obj, "command");
-        /* Show command in a small source view with sh highlighting */
-        GtkWidget *cmd_sv = create_source_view(cmd, "sh", FALSE);
+        /* Show command as plain monospace text */
+        GtkWidget *cmd_sv = create_source_view(cmd, NULL, FALSE);
         gtk_box_pack_start(GTK_BOX(te->body_box), cmd_sv, FALSE, FALSE, 0);
     } else if (input_json && strlen(input_json) > 2) {
         /* Generic: show formatted JSON */
@@ -985,11 +1556,16 @@ void chat_webview_add_tool_call(GtkWidget *webview,
 
     /* Initial result if provided */
     if (result && strlen(result) > 0) {
-        GtkWidget *res_label = gtk_label_new(result);
-        gtk_label_set_line_wrap(GTK_LABEL(res_label), TRUE);
-        gtk_label_set_xalign(GTK_LABEL(res_label), 0);
-        gtk_label_set_selectable(GTK_LABEL(res_label), TRUE);
-        gtk_box_pack_start(GTK_BOX(te->body_box), res_label, FALSE, FALSE, 0);
+        GtkWidget *result_widget = NULL;
+        if (is_grep_tool(tool_name)) {
+            result_widget = render_grep_result(result, priv);
+        } else {
+            result_widget = gtk_label_new(result);
+            gtk_label_set_line_wrap(GTK_LABEL(result_widget), TRUE);
+            gtk_label_set_xalign(GTK_LABEL(result_widget), 0);
+            gtk_label_set_selectable(GTK_LABEL(result_widget), TRUE);
+        }
+        gtk_box_pack_start(GTK_BOX(te->body_box), result_widget, FALSE, FALSE, 0);
     }
 
     gtk_container_add(GTK_CONTAINER(te->revealer), te->body_box);
@@ -1008,6 +1584,114 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     g_hash_table_insert(priv->tool_widgets, g_strdup(tool_id), te);
     g_object_unref(jp);
 
+    scroll_to_bottom(priv);
+}
+
+/* ── Thinking blocks ─────────────────────────────────────────────── */
+
+static gboolean on_thinking_header_click(GtkWidget *w, GdkEventButton *ev,
+                                          gpointer data)
+{
+    (void)w; (void)ev;
+    ThinkingEntry *te = data;
+    te->expanded = !te->expanded;
+    gtk_revealer_set_reveal_child(GTK_REVEALER(te->revealer), te->expanded);
+    gtk_label_set_text(GTK_LABEL(te->arrow_label),
+                       te->expanded ? "\u25BC" : "\u25B6");
+    return TRUE;
+}
+
+void chat_webview_add_thinking(GtkWidget *webview,
+                               const gchar *msg_id, guint fragment_index,
+                               const gchar *text, gboolean is_streaming)
+{
+    ChatViewPrivate *priv = get_priv(webview);
+    if (!priv) return;
+
+    gchar *key = g_strdup_printf("%s:%u", msg_id, fragment_index);
+
+    /* Update existing thinking widget */
+    ThinkingEntry *existing = g_hash_table_lookup(priv->thinking_widgets, key);
+    if (existing) {
+        /* Skip if unchanged */
+        if (existing->last_text && g_strcmp0(existing->last_text, text) == 0) {
+            g_free(key);
+            return;
+        }
+        g_free(existing->last_text);
+        existing->last_text = g_strdup(text);
+        gtk_label_set_text(GTK_LABEL(existing->content_label), text);
+        scroll_to_bottom(priv);
+        g_free(key);
+        return;
+    }
+
+    /* Create new thinking block */
+    ThinkingEntry *te = g_new0(ThinkingEntry, 1);
+    te->key = g_strdup(key);
+    te->expanded = FALSE;  /* collapsed by default */
+    te->last_text = g_strdup(text);
+
+    /* Outer box */
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(outer),
+                                "thinking-border");
+
+    /* Header — clickable to expand/collapse */
+    GtkWidget *header_event = gtk_event_box_new();
+    GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_style_context_add_class(gtk_widget_get_style_context(header_box),
+                                "thinking-header");
+
+    te->arrow_label = gtk_label_new("\u25B6");  /* collapsed */
+    GtkWidget *title = gtk_label_new(is_streaming ? "Thinking\u2026" : "Thinking");
+    gtk_style_context_add_class(gtk_widget_get_style_context(title),
+                                "thinking-label");
+
+    gtk_box_pack_start(GTK_BOX(header_box), te->arrow_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header_box), title, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(header_event), header_box);
+    g_signal_connect(header_event, "button-press-event",
+                     G_CALLBACK(on_thinking_header_click), te);
+    gtk_box_pack_start(GTK_BOX(outer), header_event, FALSE, FALSE, 0);
+
+    /* Revealer + body */
+    te->revealer = gtk_revealer_new();
+    gtk_revealer_set_reveal_child(GTK_REVEALER(te->revealer), te->expanded);
+    gtk_revealer_set_transition_type(GTK_REVEALER(te->revealer),
+        GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+
+    te->body_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_style_context_add_class(gtk_widget_get_style_context(te->body_box),
+                                "thinking-body");
+
+    te->content_label = gtk_label_new(text);
+    gtk_label_set_line_wrap(GTK_LABEL(te->content_label), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(te->content_label), 0);
+    gtk_label_set_selectable(GTK_LABEL(te->content_label), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(te->content_label),
+                                "thinking-label");
+    gtk_box_pack_start(GTK_BOX(te->body_box), te->content_label, FALSE, FALSE, 0);
+
+    gtk_container_add(GTK_CONTAINER(te->revealer), te->body_box);
+    gtk_box_pack_start(GTK_BOX(outer), te->revealer, FALSE, FALSE, 0);
+
+    /* Add row to list */
+    GtkWidget *row = gtk_list_box_row_new();
+    gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+    gtk_container_add(GTK_CONTAINER(row), outer);
+    te->row = row;
+
+    /* Hide welcome if still visible */
+    if (priv->welcome && gtk_widget_get_visible(priv->welcome))
+        gtk_widget_hide(priv->welcome);
+
+    gtk_list_box_insert(GTK_LIST_BOX(priv->list_box), row, -1);
+    gtk_widget_show_all(row);
+
+    g_hash_table_insert(priv->thinking_widgets, key, te);
     scroll_to_bottom(priv);
 }
 
@@ -1409,6 +2093,7 @@ void chat_webview_clear(GtkWidget *webview)
 
     g_hash_table_remove_all(priv->msg_widgets);
     g_hash_table_remove_all(priv->tool_widgets);
+    g_hash_table_remove_all(priv->thinking_widgets);
 
     /* Show welcome again */
     if (priv->welcome)

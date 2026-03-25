@@ -4,7 +4,22 @@
 #include "cli_session.h"
 #include "editor_bridge.h"
 #include "session_picker.h"
+#include <json-glib/json-glib.h>
 #include <string.h>
+
+/* Per-file edit statistics */
+typedef struct {
+    gchar *file_path;
+    gint   lines_added;
+    gint   lines_removed;
+} FileEditStat;
+
+static void free_file_edit_stat(gpointer p)
+{
+    FileEditStat *s = p;
+    g_free(s->file_path);
+    g_free(s);
+}
 
 typedef struct {
     GtkWidget   *container;  /* top-level vbox, for finding parent window */
@@ -13,6 +28,12 @@ typedef struct {
     CLISession  *session;
     guint        msg_counter;
     GHashTable  *known_msg_ids;  /* tracks which msg IDs have been added to webview */
+
+    /* Edit tracking */
+    GHashTable  *edit_stats;     /* file_path -> FileEditStat* */
+    GtkWidget   *edit_indicator; /* clickable button in header */
+    GtkWidget   *edit_popover;   /* GtkPopover with file list */
+    GtkWidget   *edit_list_box;  /* GtkListBox inside popover */
 } ChatWidgetPrivate;
 
 static const gchar *CHAT_PRIV_KEY = "geany-code-chat-private";
@@ -45,6 +66,188 @@ static void ensure_session(ChatWidgetPrivate *priv)
 
     cli_session_start(priv->session, root);
     g_free(root);
+}
+
+/* ── Edit tracking ───────────────────────────────────────────────── */
+
+static gint count_lines(const gchar *s)
+{
+    if (!s || *s == '\0') return 0;
+    gint n = 1;
+    for (const gchar *p = s; *p; p++)
+        if (*p == '\n') n++;
+    return n;
+}
+
+static void update_edit_indicator(ChatWidgetPrivate *priv);
+
+static void track_edit(ChatWidgetPrivate *priv,
+                       const gchar *tool_name,
+                       const gchar *input_json)
+{
+    gboolean is_edit = tool_name &&
+        (g_strcmp0(tool_name, "Edit") == 0 || strstr(tool_name, "edit") != NULL);
+    gboolean is_write = tool_name &&
+        (g_strcmp0(tool_name, "Write") == 0 ||
+         (strstr(tool_name, "write") != NULL && !strstr(tool_name, "Todo")));
+    if (!is_edit && !is_write) return;
+    if (!input_json) return;
+
+    JsonParser *jp = json_parser_new();
+    if (!json_parser_load_from_data(jp, input_json, -1, NULL)) {
+        g_object_unref(jp);
+        return;
+    }
+    JsonNode *root = json_parser_get_root(jp);
+    if (!root || !JSON_NODE_HOLDS_OBJECT(root)) { g_object_unref(jp); return; }
+    JsonObject *obj = json_node_get_object(root);
+
+    const gchar *file_path = json_object_has_member(obj, "file_path")
+        ? json_object_get_string_member(obj, "file_path") : NULL;
+    if (!file_path) { g_object_unref(jp); return; }
+
+    gint added = 0, removed = 0;
+
+    if (is_edit) {
+        const gchar *old_s = json_object_has_member(obj, "old_string")
+            ? json_object_get_string_member(obj, "old_string")
+            : (json_object_has_member(obj, "old_text")
+               ? json_object_get_string_member(obj, "old_text") : NULL);
+        const gchar *new_s = json_object_has_member(obj, "new_string")
+            ? json_object_get_string_member(obj, "new_string")
+            : (json_object_has_member(obj, "new_text")
+               ? json_object_get_string_member(obj, "new_text") : NULL);
+        removed = count_lines(old_s);
+        added = count_lines(new_s);
+    } else {
+        const gchar *content = json_object_has_member(obj, "content")
+            ? json_object_get_string_member(obj, "content") : NULL;
+        added = count_lines(content);
+    }
+
+    FileEditStat *stat = g_hash_table_lookup(priv->edit_stats, file_path);
+    if (!stat) {
+        stat = g_new0(FileEditStat, 1);
+        stat->file_path = g_strdup(file_path);
+        g_hash_table_insert(priv->edit_stats, stat->file_path, stat);
+    }
+    stat->lines_added += added;
+    stat->lines_removed += removed;
+
+    g_object_unref(jp);
+    update_edit_indicator(priv);
+}
+
+static void update_edit_indicator(ChatWidgetPrivate *priv)
+{
+    guint n_files = g_hash_table_size(priv->edit_stats);
+    if (n_files == 0) {
+        gtk_widget_hide(priv->edit_indicator);
+        return;
+    }
+
+    gint total_added = 0, total_removed = 0;
+    GHashTableIter iter;
+    gpointer val;
+    g_hash_table_iter_init(&iter, priv->edit_stats);
+    while (g_hash_table_iter_next(&iter, NULL, &val)) {
+        FileEditStat *s = val;
+        total_added += s->lines_added;
+        total_removed += s->lines_removed;
+    }
+
+    gchar *markup = g_markup_printf_escaped(
+        "%u file%s  <span foreground=\"#4ec94e\">+%d</span>"
+        " <span foreground=\"#e05050\">-%d</span>",
+        n_files, n_files == 1 ? "" : "s",
+        total_added, total_removed);
+
+    GtkWidget *child = gtk_bin_get_child(GTK_BIN(priv->edit_indicator));
+    gtk_label_set_markup(GTK_LABEL(child), markup);
+    g_free(markup);
+
+    gtk_widget_show(priv->edit_indicator);
+}
+
+static void on_edit_file_clicked(GtkButton *btn, gpointer user_data)
+{
+    (void)user_data;
+    const gchar *file = g_object_get_data(G_OBJECT(btn), "file");
+    if (file)
+        editor_bridge_jump_to(file, 1, 1);
+}
+
+static void rebuild_edit_list(ChatWidgetPrivate *priv)
+{
+    GList *children = gtk_container_get_children(
+        GTK_CONTAINER(priv->edit_list_box));
+    for (GList *c = children; c; c = c->next)
+        gtk_widget_destroy(GTK_WIDGET(c->data));
+    g_list_free(children);
+
+    GHashTableIter iter;
+    gpointer val;
+    g_hash_table_iter_init(&iter, priv->edit_stats);
+    while (g_hash_table_iter_next(&iter, NULL, &val)) {
+        FileEditStat *s = val;
+        gchar *base = g_path_get_basename(s->file_path);
+
+        GtkWidget *row_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_widget_set_margin_start(row_box, 6);
+        gtk_widget_set_margin_end(row_box, 6);
+        gtk_widget_set_margin_top(row_box, 2);
+        gtk_widget_set_margin_bottom(row_box, 2);
+
+        GtkWidget *file_btn = gtk_button_new_with_label(base);
+        gtk_button_set_relief(GTK_BUTTON(file_btn), GTK_RELIEF_NONE);
+        gtk_widget_set_tooltip_text(file_btn, s->file_path);
+        g_object_set_data_full(G_OBJECT(file_btn), "file",
+            g_strdup(s->file_path), g_free);
+        g_signal_connect(file_btn, "clicked",
+            G_CALLBACK(on_edit_file_clicked), NULL);
+        gtk_box_pack_start(GTK_BOX(row_box), file_btn, TRUE, TRUE, 0);
+
+        gchar *stat_markup = g_markup_printf_escaped(
+            "<span foreground=\"#4ec94e\">+%d</span> "
+            "<span foreground=\"#e05050\">-%d</span>",
+            s->lines_added, s->lines_removed);
+        GtkWidget *stat_label = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(stat_label), stat_markup);
+        g_free(stat_markup);
+        gtk_box_pack_end(GTK_BOX(row_box), stat_label, FALSE, FALSE, 0);
+
+        g_free(base);
+        gtk_list_box_insert(GTK_LIST_BOX(priv->edit_list_box), row_box, -1);
+    }
+}
+
+static void on_edit_indicator_clicked(GtkButton *btn, gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+
+    if (!priv->edit_popover) {
+        priv->edit_popover = gtk_popover_new(GTK_WIDGET(btn));
+        gtk_popover_set_position(GTK_POPOVER(priv->edit_popover), GTK_POS_BOTTOM);
+
+        GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+            GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_widget_set_size_request(scroll, 300, -1);
+        gtk_scrolled_window_set_max_content_height(
+            GTK_SCROLLED_WINDOW(scroll), 250);
+        gtk_scrolled_window_set_propagate_natural_height(
+            GTK_SCROLLED_WINDOW(scroll), TRUE);
+
+        priv->edit_list_box = gtk_list_box_new();
+        gtk_list_box_set_selection_mode(GTK_LIST_BOX(priv->edit_list_box),
+            GTK_SELECTION_NONE);
+        gtk_container_add(GTK_CONTAINER(scroll), priv->edit_list_box);
+        gtk_container_add(GTK_CONTAINER(priv->edit_popover), scroll);
+    }
+
+    rebuild_edit_list(priv);
+    gtk_widget_show_all(priv->edit_popover);
+    gtk_popover_popup(GTK_POPOVER(priv->edit_popover));
 }
 
 /* ── CLISession callbacks ────────────────────────────────────────── */
@@ -80,6 +283,7 @@ static void on_cli_tool_call(const gchar *msg_id, const gchar *tool_id,
                              const gchar *result, gpointer user_data)
 {
     ChatWidgetPrivate *priv = user_data;
+    track_edit(priv, tool_name, input_json);
     chat_webview_add_tool_call(priv->webview, msg_id, tool_id,
                                tool_name, input_json, result);
 }
@@ -139,7 +343,16 @@ static void on_cli_commands(const gchar *commands_json, gpointer user_data)
 static void on_cli_todos(const gchar *todos_json, gpointer user_data)
 {
     ChatWidgetPrivate *priv = user_data;
-    chat_webview_update_todos(priv->webview, todos_json);
+    chat_input_update_todos(priv->input, todos_json);
+}
+
+static void on_cli_thinking(const gchar *msg_id, guint fragment_index,
+                            const gchar *text, gboolean is_streaming,
+                            gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+    chat_webview_add_thinking(priv->webview, msg_id, fragment_index,
+                              text, is_streaming);
 }
 
 static void on_cli_error(const gchar *error_msg, gpointer user_data)
@@ -197,11 +410,9 @@ static void on_send(const gchar *text, gpointer user_data)
     }
     g_free(id);
 
-    /* Send to claude */
-    const gchar *file = editor_bridge_get_current_file();
-    gchar *selection = editor_bridge_get_selection();
+    /* Send to claude (no implicit file/selection — user adds context explicitly) */
     cli_session_send_message(priv->session, full_prompt->str,
-                             file, selection, images);
+                             NULL, NULL, images);
     g_list_free_full(images, g_free);
     for (GList *l = contexts; l; l = l->next) {
         ContextChunk *c = l->data;
@@ -210,7 +421,6 @@ static void on_send(const gchar *text, gpointer user_data)
         g_free(c);
     }
     g_list_free(contexts);
-    g_free(selection);
     g_string_free(full_prompt, TRUE);
 
     chat_input_set_busy(priv->input, TRUE);
@@ -234,8 +444,10 @@ static void on_new_session(gpointer user_data)
     /* Stop the current session */
     cli_session_stop(priv->session);
 
-    /* Clear tracked message IDs */
+    /* Clear tracked message IDs and edit stats */
     g_hash_table_remove_all(priv->known_msg_ids);
+    g_hash_table_remove_all(priv->edit_stats);
+    update_edit_indicator(priv);
 
     /* Clear the web view */
     chat_webview_clear(priv->webview);
@@ -254,6 +466,7 @@ static void on_new_session(gpointer user_data)
     cli_session_set_models_callback(priv->session, on_cli_models, priv);
     cli_session_set_commands_callback(priv->session, on_cli_commands, priv);
     cli_session_set_todos_callback(priv->session, on_cli_todos, priv);
+    cli_session_set_thinking_callback(priv->session, on_cli_thinking, priv);
     cli_session_set_error_callback(priv->session, on_cli_error, priv);
     cli_session_set_finished_callback(priv->session, on_cli_finished, priv);
 }
@@ -271,7 +484,8 @@ static void on_resume_session_btn(GtkButton *btn, gpointer user_data)
     (void)btn;
     ChatWidgetPrivate *priv = user_data;
 
-    gchar *root = editor_bridge_get_project_root();
+    /* Use git root for session lookup — Claude stores sessions there */
+    gchar *root = editor_bridge_get_git_root();
     if (!root) return;
 
     GtkWidget *toplevel = gtk_widget_get_toplevel(priv->container);
@@ -301,8 +515,18 @@ static void on_resume_session_btn(GtkButton *btn, gpointer user_data)
         HistoryMessage *hm = l->data;
         gchar *id = g_strdup_printf("hist_%s", hm->uuid);
 
-        chat_webview_add_history_message(priv->webview, id, hm->role,
-                                         hm->content, hm->timestamp);
+        /* Render text content if present */
+        if (hm->content)
+            chat_webview_add_history_message(priv->webview, id, hm->role,
+                                             hm->content, hm->timestamp);
+
+        /* Render tool calls */
+        for (GList *tc = hm->tool_calls; tc; tc = tc->next) {
+            HistoryToolCall *htc = tc->data;
+            chat_webview_add_tool_call(priv->webview, id, htc->tool_id,
+                                       htc->tool_name, htc->input_json, NULL);
+        }
+
         g_hash_table_add(priv->known_msg_ids, id); /* takes ownership */
     }
     if (history)
@@ -335,6 +559,7 @@ static void on_destroy(GtkWidget *widget, gpointer data)
     if (priv) {
         cli_session_free(priv->session);
         g_hash_table_unref(priv->known_msg_ids);
+        g_hash_table_unref(priv->edit_stats);
         g_free(priv);
     }
 }
@@ -346,6 +571,8 @@ GtkWidget *chat_widget_new(void)
     ChatWidgetPrivate *priv = g_new0(ChatWidgetPrivate, 1);
     priv->known_msg_ids = g_hash_table_new_full(g_str_hash, g_str_equal,
                                                  g_free, NULL);
+    priv->edit_stats = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                              NULL, free_file_edit_stat);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     priv->container = vbox;
@@ -368,6 +595,14 @@ GtkWidget *chat_widget_new(void)
     /* Spacer */
     gtk_box_pack_start(GTK_BOX(header),
                        gtk_label_new(""), TRUE, TRUE, 0);
+
+    /* Edit tracking indicator (hidden until edits occur) */
+    priv->edit_indicator = gtk_button_new_with_label("");
+    gtk_button_set_relief(GTK_BUTTON(priv->edit_indicator), GTK_RELIEF_NONE);
+    gtk_widget_set_no_show_all(priv->edit_indicator, TRUE);
+    gtk_box_pack_start(GTK_BOX(header), priv->edit_indicator, FALSE, FALSE, 0);
+    g_signal_connect(priv->edit_indicator, "clicked",
+                     G_CALLBACK(on_edit_indicator_clicked), priv);
 
     /* Resume session button (icon) */
     GtkWidget *resume_btn = gtk_button_new_from_icon_name(
@@ -416,6 +651,7 @@ GtkWidget *chat_widget_new(void)
     cli_session_set_models_callback(priv->session, on_cli_models, priv);
     cli_session_set_commands_callback(priv->session, on_cli_commands, priv);
     cli_session_set_todos_callback(priv->session, on_cli_todos, priv);
+    cli_session_set_thinking_callback(priv->session, on_cli_thinking, priv);
     cli_session_set_error_callback(priv->session, on_cli_error, priv);
     cli_session_set_finished_callback(priv->session, on_cli_finished, priv);
 

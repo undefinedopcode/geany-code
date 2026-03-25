@@ -89,6 +89,34 @@ gchar *editor_bridge_get_project_root(void)
     return g_strdup(g_get_home_dir());
 }
 
+gchar *editor_bridge_get_git_root(void)
+{
+    /* Start from the project root or current file */
+    gchar *start = editor_bridge_get_project_root();
+    if (!start) return NULL;
+
+    /* Walk up looking specifically for .git */
+    gchar *dir = g_strdup(start);
+    g_free(start);
+
+    while (dir && strcmp(dir, "/") != 0) {
+        gchar *git_path = g_build_filename(dir, ".git", NULL);
+        gboolean found = g_file_test(git_path, G_FILE_TEST_EXISTS);
+        g_free(git_path);
+        if (found)
+            return dir;
+
+        gchar *parent = g_path_get_dirname(dir);
+        g_free(dir);
+        dir = parent;
+    }
+
+    g_free(dir);
+
+    /* No .git found — fall back to project root */
+    return editor_bridge_get_project_root();
+}
+
 void editor_bridge_jump_to(const gchar *file_path,
                            gint start_line, gint end_line)
 {
