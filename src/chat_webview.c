@@ -810,28 +810,98 @@ static GtkWidget *create_source_view_for_file(const gchar *code,
     return create_source_view(code, lang, show_line_numbers);
 }
 
-/* Create a unified diff view: removed lines then added lines in one block,
- * language-highlighted, with red/green line background markers. */
+/* ── Line-level LCS diff ─────────────────────────────────────────── */
+
+typedef enum { DIFF_UNCHANGED, DIFF_REMOVED, DIFF_ADDED } DiffLineKind;
+typedef struct { DiffLineKind kind; const gchar *text; } DiffLine;
+
+/* Compute a line-level diff using LCS (Longest Common Subsequence).
+ * Returns a GArray of DiffLine in unified order. Caller frees with
+ * g_array_free(result, TRUE). text pointers borrow from old/new_lines. */
+static GArray *compute_diff_lines(gchar **old_lines, guint n_old,
+                                  gchar **new_lines, guint n_new)
+{
+    GArray *result = g_array_new(FALSE, FALSE, sizeof(DiffLine));
+
+    /* Build LCS table: L[(n_old+1) * (n_new+1)] flattened */
+    guint cols = n_new + 1;
+    guint *L = g_malloc0(sizeof(guint) * (n_old + 1) * cols);
+
+    for (guint i = 1; i <= n_old; i++) {
+        for (guint j = 1; j <= n_new; j++) {
+            if (g_strcmp0(old_lines[i - 1], new_lines[j - 1]) == 0)
+                L[i * cols + j] = L[(i - 1) * cols + (j - 1)] + 1;
+            else
+                L[i * cols + j] = MAX(L[(i - 1) * cols + j],
+                                      L[i * cols + (j - 1)]);
+        }
+    }
+
+    /* Backtrack to produce edit script (in reverse) */
+    guint i = n_old, j = n_new;
+    while (i > 0 || j > 0) {
+        DiffLine dl;
+        if (i > 0 && j > 0 &&
+            g_strcmp0(old_lines[i - 1], new_lines[j - 1]) == 0) {
+            dl.kind = DIFF_UNCHANGED;
+            dl.text = old_lines[i - 1];
+            i--; j--;
+        } else if (j > 0 &&
+                   (i == 0 || L[i * cols + (j - 1)] >= L[(i - 1) * cols + j])) {
+            dl.kind = DIFF_ADDED;
+            dl.text = new_lines[j - 1];
+            j--;
+        } else {
+            dl.kind = DIFF_REMOVED;
+            dl.text = old_lines[i - 1];
+            i--;
+        }
+        g_array_append_val(result, dl);
+    }
+
+    g_free(L);
+
+    /* Reverse (backtracking produced reverse order) */
+    for (guint a = 0, b = result->len - 1; a < b; a++, b--) {
+        DiffLine tmp = g_array_index(result, DiffLine, a);
+        g_array_index(result, DiffLine, a) = g_array_index(result, DiffLine, b);
+        g_array_index(result, DiffLine, b) = tmp;
+    }
+
+    return result;
+}
+
+/* Create a unified diff view with LCS-based line matching.
+ * Unchanged lines get no marker, removed = red bg, added = green bg. */
 static GtkWidget *create_diff_source_view(const gchar *old_s,
                                            const gchar *new_s,
                                            const gchar *file_path)
 {
-    /* Build unified content: removed lines first, then added lines */
     gchar **old_lines = old_s ? g_strsplit(old_s, "\n", -1) : NULL;
     gchar **new_lines = new_s ? g_strsplit(new_s, "\n", -1) : NULL;
     guint n_old = old_lines ? g_strv_length(old_lines) : 0;
     guint n_new = new_lines ? g_strv_length(new_lines) : 0;
 
+    /* Compute diff */
+    GArray *diff = compute_diff_lines(
+        old_lines ? old_lines : (gchar *[]){NULL}, n_old,
+        new_lines ? new_lines : (gchar *[]){NULL}, n_new);
+
+    /* Build output text and per-line marker assignments */
     GString *buf = g_string_new("");
-    for (guint i = 0; i < n_old; i++) {
+    GArray *markers = g_array_new(FALSE, FALSE, sizeof(gint));
+
+    for (guint i = 0; i < diff->len; i++) {
+        DiffLine *dl = &g_array_index(diff, DiffLine, i);
         if (buf->len > 0) g_string_append_c(buf, '\n');
-        g_string_append(buf, old_lines[i]);
-    }
-    for (guint i = 0; i < n_new; i++) {
-        if (buf->len > 0) g_string_append_c(buf, '\n');
-        g_string_append(buf, new_lines[i]);
+        g_string_append(buf, dl->text);
+        gint m = (dl->kind == DIFF_REMOVED) ? 0
+               : (dl->kind == DIFF_ADDED)   ? 1
+               : -1;
+        g_array_append_val(markers, m);
     }
 
+    /* Create language-highlighted widget */
     GtkWidget *sv = create_source_view_for_file(buf->str, file_path, FALSE);
     ScintillaObject *sci = SCINTILLA(sv);
 
@@ -846,14 +916,17 @@ static GtkWidget *create_diff_source_view(const gchar *old_s,
     scintilla_send_message(sci, SCI_MARKERSETBACK, 1, 0x55CC55); /* green (BGR) */
     scintilla_send_message(sci, SCI_MARKERSETALPHA, 1, 40);
 
-    /* Apply markers to lines */
-    for (guint i = 0; i < n_old; i++)
-        scintilla_send_message(sci, SCI_MARKERADD, i, 0);
-    for (guint i = 0; i < n_new; i++)
-        scintilla_send_message(sci, SCI_MARKERADD, n_old + i, 1);
+    /* Apply markers per line */
+    for (guint i = 0; i < markers->len; i++) {
+        gint m = g_array_index(markers, gint, i);
+        if (m >= 0)
+            scintilla_send_message(sci, SCI_MARKERADD, i, m);
+    }
 
     scintilla_send_message(sci, SCI_SETREADONLY, 1, 0);
 
+    g_array_free(diff, TRUE);
+    g_array_free(markers, TRUE);
     g_strfreev(old_lines);
     g_strfreev(new_lines);
     g_string_free(buf, TRUE);
