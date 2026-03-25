@@ -1177,6 +1177,8 @@ static gboolean is_glob_tool(const gchar *n)
 { return n && (g_strcmp0(n,"Glob")==0 || strstr(n,"glob")!=NULL); }
 static gboolean is_grep_tool(const gchar *n)
 { return n && (g_strcmp0(n,"Grep")==0 || strstr(n,"grep")!=NULL); }
+static gboolean is_mcp_tool(const gchar *n)
+{ return n && strstr(n, "mcp__") != NULL; }
 
 /* Get display name for tool */
 static const gchar *tool_display_name(const gchar *name)
@@ -1188,6 +1190,13 @@ static const gchar *tool_display_name(const gchar *name)
     if (is_bash_tool(name)) return "Bash";
     if (is_glob_tool(name)) return "Glob";
     if (is_grep_tool(name)) return "Grep";
+    if (is_mcp_tool(name)) {
+        /* Use last segment after "__" as display name */
+        const gchar *last = strrchr(name, '_');
+        if (last && last > name && *(last - 1) == '_')
+            return last + 1;
+        return name;
+    }
     return name;
 }
 
@@ -1493,6 +1502,9 @@ void chat_webview_add_tool_call(GtkWidget *webview,
                 result_widget = create_source_view(result, NULL, FALSE);
             } else if (is_grep_tool(existing->tool_name)) {
                 result_widget = render_grep_result(result, priv);
+            } else if (is_mcp_tool(existing->tool_name)) {
+                /* MCP tool output as plain monospace text */
+                result_widget = create_source_view(result, NULL, FALSE);
             } else {
                 /* Default: plain label */
                 GtkWidget *res_label = gtk_label_new(result);
