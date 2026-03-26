@@ -1473,11 +1473,13 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     /* Result update for existing tool */
     ToolEntry *existing = g_hash_table_lookup(priv->tool_widgets, tool_id);
     if (existing) {
-        /* Update status */
+        /* Update status — red dot for errors, green for success */
+        gboolean is_error = (tool_name && g_strcmp0(tool_name, "(error)") == 0);
         gtk_style_context_remove_class(
             gtk_widget_get_style_context(existing->status_label), "tool-status-running");
         gtk_style_context_add_class(
-            gtk_widget_get_style_context(existing->status_label), "tool-status-success");
+            gtk_widget_get_style_context(existing->status_label),
+            is_error ? "tool-status-error" : "tool-status-success");
         gtk_label_set_text(GTK_LABEL(existing->status_label), "\u25CF");
 
         /* Append result — render based on tool type */

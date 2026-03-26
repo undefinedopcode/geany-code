@@ -1266,19 +1266,32 @@ static void process_json_line(CLISession *session, const gchar *line)
             g_free(session->mcp_status_request_id);
             session->mcp_status_request_id = NULL;
 
-            /* Only forward if response is an array (not an error object) */
+            /* Response may be a direct array or {mcpServers: [...]} */
             if (session->mcp_status_cb &&
                 json_object_has_member(outer, "response")) {
                 JsonNode *resp_node = json_object_get_member(outer, "response");
+                JsonNode *arr_node = NULL;
+
                 if (JSON_NODE_HOLDS_ARRAY(resp_node)) {
+                    arr_node = resp_node;
+                } else if (JSON_NODE_HOLDS_OBJECT(resp_node)) {
+                    JsonObject *robj = json_node_get_object(resp_node);
+                    if (json_object_has_member(robj, "mcpServers")) {
+                        JsonNode *ms = json_object_get_member(robj, "mcpServers");
+                        if (JSON_NODE_HOLDS_ARRAY(ms))
+                            arr_node = ms;
+                    }
+                }
+
+                if (arr_node) {
                     JsonGenerator *rg = json_generator_new();
-                    json_generator_set_root(rg, resp_node);
+                    json_generator_set_root(rg, arr_node);
                     gchar *rjson = json_generator_to_data(rg, NULL);
                     session->mcp_status_cb(rjson, session->mcp_status_data);
                     g_free(rjson);
                     g_object_unref(rg);
                 } else {
-                    DBG("mcp_server_status response was not an array, ignoring");
+                    DBG("mcp_status response: no server array found");
                 }
             }
         } else {
@@ -1395,7 +1408,7 @@ void cli_session_query_mcp_status(CLISession *session)
     gchar *json = g_strdup_printf(
         "{\"type\":\"control_request\","
         "\"request_id\":\"%s\","
-        "\"request\":{\"subtype\":\"mcp_server_status\"}}\n",
+        "\"request\":{\"subtype\":\"mcp_status\"}}\n",
         session->mcp_status_request_id);
 
     g_output_stream_write_all(session->stdin_pipe,
@@ -1415,7 +1428,7 @@ void cli_session_mcp_toggle(CLISession *session, const gchar *server_name,
         "{\"type\":\"control_request\","
         "\"request_id\":\"mcp_toggle_%ld\","
         "\"request\":{\"subtype\":\"mcp_toggle\","
-        "\"server_name\":\"%s\",\"enabled\":%s}}\n",
+        "\"serverName\":\"%s\",\"enabled\":%s}}\n",
         g_get_monotonic_time(), server_name, enabled ? "true" : "false");
 
     g_output_stream_write_all(session->stdin_pipe,
@@ -1434,7 +1447,7 @@ void cli_session_mcp_reconnect(CLISession *session, const gchar *server_name)
         "{\"type\":\"control_request\","
         "\"request_id\":\"mcp_reconnect_%ld\","
         "\"request\":{\"subtype\":\"mcp_reconnect\","
-        "\"server_name\":\"%s\"}}\n",
+        "\"serverName\":\"%s\"}}\n",
         g_get_monotonic_time(), server_name);
 
     g_output_stream_write_all(session->stdin_pipe,

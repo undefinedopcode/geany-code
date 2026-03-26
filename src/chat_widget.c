@@ -507,8 +507,8 @@ static void on_mcp_indicator_clicked(GtkButton *btn, gpointer user_data)
         gtk_container_add(GTK_CONTAINER(priv->mcp_popover), scroll);
     }
 
-    /* Show cached data from init (mcp_server_status query not
-     * supported by all CLI versions, so don't refresh) */
+    /* Refresh status from CLI and show cached data immediately */
+    cli_session_query_mcp_status(priv->session);
     rebuild_mcp_list(priv);
     gtk_widget_show_all(priv->mcp_popover);
     gtk_popover_popup(GTK_POPOVER(priv->mcp_popover));
