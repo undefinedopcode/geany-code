@@ -50,6 +50,9 @@ struct _CLISession {
     gpointer       todos_data;
     CLIThinkingCb  thinking_cb;
     gpointer       thinking_data;
+    CLIMcpStatusCb mcp_status_cb;
+    gpointer       mcp_status_data;
+    gchar         *mcp_status_request_id;
     CLIErrorCb     error_cb;
     gpointer       error_data;
     CLIFinishedCb  finished_cb;
@@ -88,6 +91,7 @@ void cli_session_free(CLISession *session)
     g_string_free(session->current_content, TRUE);
     g_hash_table_unref(session->pending_permissions);
     g_free(session->init_request_id);
+    g_free(session->mcp_status_request_id);
     g_free(session->current_msg_id);
     g_free(session->session_id);
     g_free(session->permission_mode);
@@ -808,12 +812,26 @@ static void process_json_line(CLISession *session, const gchar *line)
             if (clen > 8) DBG("  ... and %u more", clen - 8);
         }
 
+        /* Extract MCP server status */
+        if (json_object_has_member(obj, "mcp_servers") && session->mcp_status_cb) {
+            JsonArray *mcp = json_object_get_array_member(obj, "mcp_servers");
+            DBG("MCP servers: %u", json_array_get_length(mcp));
+            JsonGenerator *mg = json_generator_new();
+            JsonNode *mnode = json_node_new(JSON_NODE_ARRAY);
+            json_node_set_array(mnode, mcp);
+            json_generator_set_root(mg, mnode);
+            gchar *mjson = json_generator_to_data(mg, NULL);
+            session->mcp_status_cb(mjson, session->mcp_status_data);
+            g_free(mjson);
+            json_node_free(mnode);
+            g_object_unref(mg);
+        }
+
         /* Create a placeholder message for streaming into */
         g_free(session->current_msg_id);
         session->current_msg_id = g_strdup_printf("msg_%ld",
             g_get_monotonic_time());
         g_string_truncate(session->current_content, 0);
-
 
     } else if (g_strcmp0(type, "assistant") == 0) {
         /* Assistant message - may be partial (streaming) or complete.
@@ -1243,6 +1261,26 @@ static void process_json_line(CLISession *session, const gchar *line)
                     ? json_object_get_string_member(acct, "subscriptionType") : "";
                 DBG("Initialize: account %s (%s)", email, sub);
             }
+        } else if (session->mcp_status_request_id &&
+                   g_strcmp0(resp_id, session->mcp_status_request_id) == 0) {
+            g_free(session->mcp_status_request_id);
+            session->mcp_status_request_id = NULL;
+
+            /* Only forward if response is an array (not an error object) */
+            if (session->mcp_status_cb &&
+                json_object_has_member(outer, "response")) {
+                JsonNode *resp_node = json_object_get_member(outer, "response");
+                if (JSON_NODE_HOLDS_ARRAY(resp_node)) {
+                    JsonGenerator *rg = json_generator_new();
+                    json_generator_set_root(rg, resp_node);
+                    gchar *rjson = json_generator_to_data(rg, NULL);
+                    session->mcp_status_cb(rjson, session->mcp_status_data);
+                    g_free(rjson);
+                    g_object_unref(rg);
+                } else {
+                    DBG("mcp_server_status response was not an array, ignoring");
+                }
+            }
         } else {
             DBG("control_response for request: %s", resp_id);
         }
@@ -1336,6 +1374,72 @@ void cli_session_set_thinking_callback(CLISession *session, CLIThinkingCb cb,
 {
     session->thinking_cb = cb;
     session->thinking_data = data;
+}
+
+void cli_session_set_mcp_status_callback(CLISession *session, CLIMcpStatusCb cb,
+                                          gpointer data)
+{
+    session->mcp_status_cb = cb;
+    session->mcp_status_data = data;
+}
+
+void cli_session_query_mcp_status(CLISession *session)
+{
+    if (!session->running || !session->stdin_pipe)
+        return;
+
+    g_free(session->mcp_status_request_id);
+    session->mcp_status_request_id = g_strdup_printf("mcp_status_%ld",
+        g_get_monotonic_time());
+
+    gchar *json = g_strdup_printf(
+        "{\"type\":\"control_request\","
+        "\"request_id\":\"%s\","
+        "\"request\":{\"subtype\":\"mcp_server_status\"}}\n",
+        session->mcp_status_request_id);
+
+    g_output_stream_write_all(session->stdin_pipe,
+                              json, strlen(json), NULL, NULL, NULL);
+    g_free(json);
+}
+
+void cli_session_mcp_toggle(CLISession *session, const gchar *server_name,
+                             gboolean enabled)
+{
+    if (!session->running || !session->stdin_pipe || !server_name)
+        return;
+
+    DBG("MCP toggle: %s -> %s", server_name, enabled ? "enabled" : "disabled");
+
+    gchar *json = g_strdup_printf(
+        "{\"type\":\"control_request\","
+        "\"request_id\":\"mcp_toggle_%ld\","
+        "\"request\":{\"subtype\":\"mcp_toggle\","
+        "\"server_name\":\"%s\",\"enabled\":%s}}\n",
+        g_get_monotonic_time(), server_name, enabled ? "true" : "false");
+
+    g_output_stream_write_all(session->stdin_pipe,
+                              json, strlen(json), NULL, NULL, NULL);
+    g_free(json);
+}
+
+void cli_session_mcp_reconnect(CLISession *session, const gchar *server_name)
+{
+    if (!session->running || !session->stdin_pipe || !server_name)
+        return;
+
+    DBG("MCP reconnect: %s", server_name);
+
+    gchar *json = g_strdup_printf(
+        "{\"type\":\"control_request\","
+        "\"request_id\":\"mcp_reconnect_%ld\","
+        "\"request\":{\"subtype\":\"mcp_reconnect\","
+        "\"server_name\":\"%s\"}}\n",
+        g_get_monotonic_time(), server_name);
+
+    g_output_stream_write_all(session->stdin_pipe,
+                              json, strlen(json), NULL, NULL, NULL);
+    g_free(json);
 }
 
 void cli_session_set_error_callback(CLISession *session, CLIErrorCb cb,

@@ -34,6 +34,12 @@ typedef struct {
     GtkWidget   *edit_indicator; /* clickable button in header */
     GtkWidget   *edit_popover;   /* GtkPopover with file list */
     GtkWidget   *edit_list_box;  /* GtkListBox inside popover */
+
+    /* MCP server status */
+    GtkWidget   *mcp_indicator;  /* label button in header */
+    GtkWidget   *mcp_popover;    /* GtkPopover with server list */
+    GtkWidget   *mcp_list_box;   /* GtkListBox inside popover */
+    gchar       *mcp_servers_json; /* cached latest status JSON */
 } ChatWidgetPrivate;
 
 static const gchar *CHAT_PRIV_KEY = "geany-code-chat-private";
@@ -250,7 +256,273 @@ static void on_edit_indicator_clicked(GtkButton *btn, gpointer user_data)
     gtk_popover_popup(GTK_POPOVER(priv->edit_popover));
 }
 
+/* ── MCP server status ───────────────────────────────────────────── */
+
+static void rebuild_mcp_list(ChatWidgetPrivate *priv);
+
+static void update_mcp_indicator(ChatWidgetPrivate *priv)
+{
+    if (!priv->mcp_servers_json || priv->mcp_servers_json[0] == '\0') {
+        gtk_widget_hide(priv->mcp_indicator);
+        return;
+    }
+
+    /* Parse to count statuses */
+    JsonParser *jp = json_parser_new();
+    if (!json_parser_load_from_data(jp, priv->mcp_servers_json, -1, NULL)) {
+        g_object_unref(jp);
+        gtk_widget_hide(priv->mcp_indicator);
+        return;
+    }
+    JsonNode *root = json_parser_get_root(jp);
+    if (!root || !JSON_NODE_HOLDS_ARRAY(root)) {
+        g_object_unref(jp);
+        gtk_widget_hide(priv->mcp_indicator);
+        return;
+    }
+
+    JsonArray *arr = json_node_get_array(root);
+    guint n = json_array_get_length(arr);
+    if (n == 0) {
+        g_object_unref(jp);
+        gtk_widget_hide(priv->mcp_indicator);
+        return;
+    }
+
+    guint n_connected = 0, n_failed = 0, n_disabled = 0, n_other = 0;
+    for (guint i = 0; i < n; i++) {
+        JsonObject *srv = json_array_get_object_element(arr, i);
+        const gchar *status = json_object_has_member(srv, "status")
+            ? json_object_get_string_member(srv, "status") : "";
+        if (g_strcmp0(status, "connected") == 0) n_connected++;
+        else if (g_strcmp0(status, "failed") == 0) n_failed++;
+        else if (g_strcmp0(status, "disabled") == 0) n_disabled++;
+        else n_other++;
+    }
+
+    /* Choose color: green if all ok, red if any failed, yellow if mixed */
+    const gchar *color;
+    if (n_failed > 0)
+        color = "#e05050";
+    else if (n_other > 0)
+        color = "#e0c050";
+    else
+        color = "#4ec94e";
+
+    gchar *markup = g_markup_printf_escaped(
+        "<span foreground=\"%s\">\u25CF</span> MCP", color);
+    GtkWidget *child = gtk_bin_get_child(GTK_BIN(priv->mcp_indicator));
+    gtk_label_set_markup(GTK_LABEL(child), markup);
+    g_free(markup);
+
+    /* Tooltip summary */
+    GString *tip = g_string_new("");
+    if (n_connected > 0) g_string_append_printf(tip, "%u connected", n_connected);
+    if (n_failed > 0) {
+        if (tip->len > 0) g_string_append(tip, ", ");
+        g_string_append_printf(tip, "%u failed", n_failed);
+    }
+    if (n_disabled > 0) {
+        if (tip->len > 0) g_string_append(tip, ", ");
+        g_string_append_printf(tip, "%u disabled", n_disabled);
+    }
+    if (n_other > 0) {
+        if (tip->len > 0) g_string_append(tip, ", ");
+        g_string_append_printf(tip, "%u pending", n_other);
+    }
+    gtk_widget_set_tooltip_text(priv->mcp_indicator, tip->str);
+    g_string_free(tip, TRUE);
+
+    gtk_widget_show(priv->mcp_indicator);
+    g_object_unref(jp);
+
+    /* Rebuild popover if visible */
+    if (priv->mcp_popover && gtk_widget_get_visible(priv->mcp_popover))
+        rebuild_mcp_list(priv);
+}
+
+static void on_mcp_action_clicked(GtkButton *btn, gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+    const gchar *server = g_object_get_data(G_OBJECT(btn), "server");
+    const gchar *action = g_object_get_data(G_OBJECT(btn), "action");
+    if (!server || !action) return;
+
+    if (g_strcmp0(action, "disable") == 0)
+        cli_session_mcp_toggle(priv->session, server, FALSE);
+    else if (g_strcmp0(action, "enable") == 0)
+        cli_session_mcp_toggle(priv->session, server, TRUE);
+    else if (g_strcmp0(action, "reconnect") == 0)
+        cli_session_mcp_reconnect(priv->session, server);
+}
+
+static void rebuild_mcp_list(ChatWidgetPrivate *priv)
+{
+    /* Clear existing rows */
+    GList *children = gtk_container_get_children(
+        GTK_CONTAINER(priv->mcp_list_box));
+    for (GList *c = children; c; c = c->next)
+        gtk_widget_destroy(GTK_WIDGET(c->data));
+    g_list_free(children);
+
+    if (!priv->mcp_servers_json)
+        return;
+
+    JsonParser *jp = json_parser_new();
+    if (!json_parser_load_from_data(jp, priv->mcp_servers_json, -1, NULL)) {
+        g_object_unref(jp);
+        return;
+    }
+    JsonNode *root = json_parser_get_root(jp);
+    if (!root || !JSON_NODE_HOLDS_ARRAY(root)) {
+        g_object_unref(jp);
+        return;
+    }
+
+    JsonArray *arr = json_node_get_array(root);
+    guint n = json_array_get_length(arr);
+
+    for (guint i = 0; i < n; i++) {
+        JsonObject *srv = json_array_get_object_element(arr, i);
+        const gchar *name = json_object_has_member(srv, "name")
+            ? json_object_get_string_member(srv, "name") : "unknown";
+        const gchar *status = json_object_has_member(srv, "status")
+            ? json_object_get_string_member(srv, "status") : "unknown";
+        const gchar *error = json_object_has_member(srv, "error")
+            ? json_object_get_string_member(srv, "error") : NULL;
+
+        GtkWidget *row_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        gtk_widget_set_margin_start(row_box, 8);
+        gtk_widget_set_margin_end(row_box, 8);
+        gtk_widget_set_margin_top(row_box, 4);
+        gtk_widget_set_margin_bottom(row_box, 4);
+
+        GtkWidget *top_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+        /* Status dot */
+        const gchar *dot_color;
+        const gchar *dot_char = "\u25CF";
+        if (g_strcmp0(status, "connected") == 0) dot_color = "#4ec94e";
+        else if (g_strcmp0(status, "failed") == 0) dot_color = "#e05050";
+        else if (g_strcmp0(status, "disabled") == 0) { dot_color = "#888888"; dot_char = "\u25CB"; }
+        else dot_color = "#e0c050";
+
+        gchar *dot_markup = g_markup_printf_escaped(
+            "<span foreground=\"%s\">%s</span>", dot_color, dot_char);
+        GtkWidget *dot = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(dot), dot_markup);
+        g_free(dot_markup);
+        gtk_box_pack_start(GTK_BOX(top_row), dot, FALSE, FALSE, 0);
+
+        /* Server name (bold) */
+        GtkWidget *name_label = gtk_label_new(name);
+        PangoAttrList *attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
+        gtk_label_set_attributes(GTK_LABEL(name_label), attrs);
+        pango_attr_list_unref(attrs);
+        gtk_box_pack_start(GTK_BOX(top_row), name_label, FALSE, FALSE, 0);
+
+        /* Spacer */
+        gtk_box_pack_start(GTK_BOX(top_row), gtk_label_new(""), TRUE, TRUE, 0);
+
+        /* Status text (dim) */
+        gchar *status_cap = g_strdup(status);
+        if (status_cap[0] >= 'a' && status_cap[0] <= 'z')
+            status_cap[0] -= 32;
+        GtkWidget *status_label = gtk_label_new(status_cap);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(status_label), "dim-label");
+        g_free(status_cap);
+        gtk_box_pack_start(GTK_BOX(top_row), status_label, FALSE, FALSE, 0);
+
+        /* Action button */
+        const gchar *action_label = NULL;
+        const gchar *action_id = NULL;
+        if (g_strcmp0(status, "connected") == 0) {
+            action_label = "Disable"; action_id = "disable";
+        } else if (g_strcmp0(status, "failed") == 0) {
+            action_label = "Reconnect"; action_id = "reconnect";
+        } else if (g_strcmp0(status, "disabled") == 0) {
+            action_label = "Enable"; action_id = "enable";
+        }
+
+        if (action_label) {
+            GtkWidget *btn = gtk_button_new_with_label(action_label);
+            gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
+            g_object_set_data_full(G_OBJECT(btn), "server",
+                g_strdup(name), g_free);
+            g_object_set_data_full(G_OBJECT(btn), "action",
+                g_strdup(action_id), g_free);
+            g_signal_connect(btn, "clicked",
+                G_CALLBACK(on_mcp_action_clicked), priv);
+            gtk_box_pack_end(GTK_BOX(top_row), btn, FALSE, FALSE, 0);
+        }
+
+        gtk_box_pack_start(GTK_BOX(row_box), top_row, FALSE, FALSE, 0);
+
+        /* Error text for failed servers */
+        if (error && g_strcmp0(status, "failed") == 0) {
+            GtkWidget *err_label = gtk_label_new(error);
+            gtk_label_set_xalign(GTK_LABEL(err_label), 0);
+            gtk_label_set_line_wrap(GTK_LABEL(err_label), TRUE);
+            gtk_widget_set_margin_start(err_label, 24);
+            PangoAttrList *ea = pango_attr_list_new();
+            pango_attr_list_insert(ea, pango_attr_scale_new(PANGO_SCALE_SMALL));
+            pango_attr_list_insert(ea,
+                pango_attr_foreground_new(0xAAAA, 0x4444, 0x4444));
+            gtk_label_set_attributes(GTK_LABEL(err_label), ea);
+            pango_attr_list_unref(ea);
+            gtk_box_pack_start(GTK_BOX(row_box), err_label, FALSE, FALSE, 0);
+        }
+
+        gtk_list_box_insert(GTK_LIST_BOX(priv->mcp_list_box), row_box, -1);
+    }
+
+    gtk_widget_show_all(priv->mcp_list_box);
+    g_object_unref(jp);
+}
+
+static void on_mcp_indicator_clicked(GtkButton *btn, gpointer user_data)
+{
+    (void)btn;
+    ChatWidgetPrivate *priv = user_data;
+
+    if (!priv->mcp_popover) {
+        priv->mcp_popover = gtk_popover_new(GTK_WIDGET(priv->mcp_indicator));
+        gtk_popover_set_position(GTK_POPOVER(priv->mcp_popover), GTK_POS_BOTTOM);
+
+        GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+            GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_widget_set_size_request(scroll, 350, -1);
+        gtk_scrolled_window_set_max_content_height(
+            GTK_SCROLLED_WINDOW(scroll), 300);
+        gtk_scrolled_window_set_propagate_natural_height(
+            GTK_SCROLLED_WINDOW(scroll), TRUE);
+
+        priv->mcp_list_box = gtk_list_box_new();
+        gtk_list_box_set_selection_mode(GTK_LIST_BOX(priv->mcp_list_box),
+            GTK_SELECTION_NONE);
+        gtk_container_add(GTK_CONTAINER(scroll), priv->mcp_list_box);
+        gtk_container_add(GTK_CONTAINER(priv->mcp_popover), scroll);
+    }
+
+    /* Show cached data from init (mcp_server_status query not
+     * supported by all CLI versions, so don't refresh) */
+    rebuild_mcp_list(priv);
+    gtk_widget_show_all(priv->mcp_popover);
+    gtk_popover_popup(GTK_POPOVER(priv->mcp_popover));
+}
+
 /* ── CLISession callbacks ────────────────────────────────────────── */
+
+static void on_cli_mcp_status(const gchar *servers_json, gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+    g_free(priv->mcp_servers_json);
+    priv->mcp_servers_json = g_strdup(servers_json);
+    update_mcp_indicator(priv);
+}
 
 static void on_cli_message(const gchar *msg_id, const gchar *role,
                            const gchar *content, gboolean is_streaming,
@@ -448,6 +720,9 @@ static void on_new_session(gpointer user_data)
     g_hash_table_remove_all(priv->known_msg_ids);
     g_hash_table_remove_all(priv->edit_stats);
     update_edit_indicator(priv);
+    g_free(priv->mcp_servers_json);
+    priv->mcp_servers_json = NULL;
+    gtk_widget_hide(priv->mcp_indicator);
 
     /* Clear the web view */
     chat_webview_clear(priv->webview);
@@ -467,6 +742,7 @@ static void on_new_session(gpointer user_data)
     cli_session_set_commands_callback(priv->session, on_cli_commands, priv);
     cli_session_set_todos_callback(priv->session, on_cli_todos, priv);
     cli_session_set_thinking_callback(priv->session, on_cli_thinking, priv);
+    cli_session_set_mcp_status_callback(priv->session, on_cli_mcp_status, priv);
     cli_session_set_error_callback(priv->session, on_cli_error, priv);
     cli_session_set_finished_callback(priv->session, on_cli_finished, priv);
 }
@@ -560,6 +836,7 @@ static void on_destroy(GtkWidget *widget, gpointer data)
         cli_session_free(priv->session);
         g_hash_table_unref(priv->known_msg_ids);
         g_hash_table_unref(priv->edit_stats);
+        g_free(priv->mcp_servers_json);
         g_free(priv);
     }
 }
@@ -603,6 +880,14 @@ GtkWidget *chat_widget_new(void)
     gtk_box_pack_start(GTK_BOX(header), priv->edit_indicator, FALSE, FALSE, 0);
     g_signal_connect(priv->edit_indicator, "clicked",
                      G_CALLBACK(on_edit_indicator_clicked), priv);
+
+    /* MCP server status indicator (hidden until init provides data) */
+    priv->mcp_indicator = gtk_button_new_with_label("");
+    gtk_button_set_relief(GTK_BUTTON(priv->mcp_indicator), GTK_RELIEF_NONE);
+    gtk_widget_set_no_show_all(priv->mcp_indicator, TRUE);
+    gtk_box_pack_start(GTK_BOX(header), priv->mcp_indicator, FALSE, FALSE, 0);
+    g_signal_connect(priv->mcp_indicator, "clicked",
+                     G_CALLBACK(on_mcp_indicator_clicked), priv);
 
     /* Resume session button (icon) */
     GtkWidget *resume_btn = gtk_button_new_from_icon_name(
@@ -652,6 +937,7 @@ GtkWidget *chat_widget_new(void)
     cli_session_set_commands_callback(priv->session, on_cli_commands, priv);
     cli_session_set_todos_callback(priv->session, on_cli_todos, priv);
     cli_session_set_thinking_callback(priv->session, on_cli_thinking, priv);
+    cli_session_set_mcp_status_callback(priv->session, on_cli_mcp_status, priv);
     cli_session_set_error_callback(priv->session, on_cli_error, priv);
     cli_session_set_finished_callback(priv->session, on_cli_finished, priv);
 
