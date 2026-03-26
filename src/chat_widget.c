@@ -354,6 +354,9 @@ static void on_mcp_action_clicked(GtkButton *btn, gpointer user_data)
         cli_session_mcp_toggle(priv->session, server, TRUE);
     else if (g_strcmp0(action, "reconnect") == 0)
         cli_session_mcp_reconnect(priv->session, server);
+
+    /* Refresh status after action (response will update popover) */
+    cli_session_query_mcp_status(priv->session);
 }
 
 static void rebuild_mcp_list(ChatWidgetPrivate *priv)
@@ -436,23 +439,30 @@ static void rebuild_mcp_list(ChatWidgetPrivate *priv)
         gtk_box_pack_start(GTK_BOX(top_row), status_label, FALSE, FALSE, 0);
 
         /* Action button */
-        const gchar *action_label = NULL;
-        const gchar *action_id = NULL;
+        /* Action buttons — pack_end so they appear right-to-left */
+        typedef struct { const gchar *label; const gchar *action; } BtnDef;
+        BtnDef btns[3];
+        gint n_btns = 0;
+
         if (g_strcmp0(status, "connected") == 0) {
-            action_label = "Disable"; action_id = "disable";
-        } else if (g_strcmp0(status, "failed") == 0) {
-            action_label = "Reconnect"; action_id = "reconnect";
+            btns[n_btns++] = (BtnDef){"Disable", "disable"};
+            btns[n_btns++] = (BtnDef){"\u27F3", "reconnect"};
+        } else if (g_strcmp0(status, "failed") == 0 ||
+                   g_strcmp0(status, "needs-auth") == 0) {
+            btns[n_btns++] = (BtnDef){"\u27F3", "reconnect"};
         } else if (g_strcmp0(status, "disabled") == 0) {
-            action_label = "Enable"; action_id = "enable";
+            btns[n_btns++] = (BtnDef){"Enable", "enable"};
         }
 
-        if (action_label) {
-            GtkWidget *btn = gtk_button_new_with_label(action_label);
+        for (gint bi = 0; bi < n_btns; bi++) {
+            GtkWidget *btn = gtk_button_new_with_label(btns[bi].label);
             gtk_button_set_relief(GTK_BUTTON(btn), GTK_RELIEF_NONE);
+            if (g_strcmp0(btns[bi].action, "reconnect") == 0)
+                gtk_widget_set_tooltip_text(btn, "Reconnect");
             g_object_set_data_full(G_OBJECT(btn), "server",
                 g_strdup(name), g_free);
             g_object_set_data_full(G_OBJECT(btn), "action",
-                g_strdup(action_id), g_free);
+                g_strdup(btns[bi].action), g_free);
             g_signal_connect(btn, "clicked",
                 G_CALLBACK(on_mcp_action_clicked), priv);
             gtk_box_pack_end(GTK_BOX(top_row), btn, FALSE, FALSE, 0);
