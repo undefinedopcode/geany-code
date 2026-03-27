@@ -1633,6 +1633,9 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     }
     if (slug) {
         GtkWidget *pill = gtk_label_new(slug);
+        gtk_label_set_ellipsize(GTK_LABEL(pill), PANGO_ELLIPSIZE_END);
+        gtk_label_set_max_width_chars(GTK_LABEL(pill), 50);
+        gtk_label_set_single_line_mode(GTK_LABEL(pill), TRUE);
         gtk_style_context_add_class(gtk_widget_get_style_context(pill), "tool-file-pill");
         gtk_box_pack_start(GTK_BOX(header_box), pill, FALSE, FALSE, 4);
         g_free(slug);
