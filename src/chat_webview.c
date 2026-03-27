@@ -1257,6 +1257,19 @@ static const gchar *tool_display_name(const gchar *name)
     return name;
 }
 
+/* Get symbolic icon name for tool type */
+static const gchar *tool_icon_name(const gchar *name)
+{
+    if (is_edit_tool(name))  return "document-edit-symbolic";
+    if (is_write_tool(name)) return "document-new-symbolic";
+    if (is_read_tool(name))  return "document-open-symbolic";
+    if (is_bash_tool(name))  return "utilities-terminal-symbolic";
+    if (is_glob_tool(name))  return "folder-symbolic";
+    if (is_grep_tool(name))  return "edit-find-symbolic";
+    if (is_mcp_tool(name))   return "network-server-symbolic";
+    return NULL;
+}
+
 /* ── Jump to file button click ────────────────────────────────────── */
 
 static void on_jump_btn_clicked(GtkButton *btn, gpointer data)
@@ -1277,7 +1290,7 @@ static gboolean on_tool_header_click(GtkWidget *w, GdkEventButton *ev,
     ToolEntry *te = data;
     te->expanded = !te->expanded;
     gtk_revealer_set_reveal_child(GTK_REVEALER(te->revealer), te->expanded);
-    gtk_label_set_text(GTK_LABEL(te->arrow_label), te->expanded ? "\u25BC" : "\u25B6");
+    gtk_label_set_text(GTK_LABEL(te->arrow_label), te->expanded ? "\u2304" : "\u203A");
     return TRUE;
 }
 
@@ -1294,7 +1307,7 @@ static const gchar *base_css =
     ".tool-header { padding: 6px 10px; border-radius: 4px 4px 0 0; }\n"
     ".tool-header:hover { background: alpha(@theme_fg_color, 0.06); }\n"
     ".tool-border { border: 2px solid @borders; border-radius: 6px; "
-    "  margin-top: 4px; margin-bottom: 4px; }\n"
+    "  margin: 4px 12px; }\n"
     ".tool-body { padding: 8px 10px; }\n"
     ".tool-file-pill { background: alpha(black, 0.2); border-radius: 9px; "
     "  padding: 1px 8px; font-size: small; }\n"
@@ -1611,11 +1624,23 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_style_context_add_class(gtk_widget_get_style_context(header_box), "tool-header");
 
-    te->arrow_label = gtk_label_new(te->expanded ? "\u25BC" : "\u25B6");
+    /* Status dot first */
+    te->status_label = gtk_label_new("\u25CF");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(te->status_label), "tool-status-running");
+    gtk_box_pack_start(GTK_BOX(header_box), te->status_label, FALSE, FALSE, 0);
+
+    /* Tool type icon */
+    const gchar *icon_name = tool_icon_name(tool_name);
+    if (icon_name) {
+        GtkWidget *icon = gtk_image_new_from_icon_name(
+            icon_name, GTK_ICON_SIZE_SMALL_TOOLBAR);
+        gtk_widget_set_opacity(icon, 0.6);
+        gtk_box_pack_start(GTK_BOX(header_box), icon, FALSE, FALSE, 0);
+    }
+
     GtkWidget *name_label = gtk_label_new(display);
     gtk_label_set_xalign(GTK_LABEL(name_label), 0);
-
-    gtk_box_pack_start(GTK_BOX(header_box), te->arrow_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(header_box), name_label, FALSE, FALSE, 0);
 
     /* File path pill or slug */
@@ -1641,12 +1666,10 @@ void chat_webview_add_tool_call(GtkWidget *webview,
         g_free(slug);
     }
 
-    /* Spacer + status dot */
+    /* Spacer + collapse/expand arrow on the right */
     gtk_box_pack_start(GTK_BOX(header_box), gtk_label_new(""), TRUE, TRUE, 0);
-    te->status_label = gtk_label_new("\u25CF");
-    gtk_style_context_add_class(
-        gtk_widget_get_style_context(te->status_label), "tool-status-running");
-    gtk_box_pack_end(GTK_BOX(header_box), te->status_label, FALSE, FALSE, 0);
+    te->arrow_label = gtk_label_new(te->expanded ? "\u2304" : "\u203A");
+    gtk_box_pack_end(GTK_BOX(header_box), te->arrow_label, FALSE, FALSE, 0);
 
     gtk_container_add(GTK_CONTAINER(header_event), header_box);
     g_signal_connect(header_event, "button-press-event",
@@ -1759,7 +1782,7 @@ static gboolean on_thinking_header_click(GtkWidget *w, GdkEventButton *ev,
     te->expanded = !te->expanded;
     gtk_revealer_set_reveal_child(GTK_REVEALER(te->revealer), te->expanded);
     gtk_label_set_text(GTK_LABEL(te->arrow_label),
-                       te->expanded ? "\u25BC" : "\u25B6");
+                       te->expanded ? "\u2304" : "\u203A");
     return TRUE;
 }
 
@@ -1805,7 +1828,7 @@ void chat_webview_add_thinking(GtkWidget *webview,
     gtk_style_context_add_class(gtk_widget_get_style_context(header_box),
                                 "thinking-header");
 
-    te->arrow_label = gtk_label_new("\u25B6");  /* collapsed */
+    te->arrow_label = gtk_label_new("\u203A");  /* collapsed */
     GtkWidget *title = gtk_label_new(is_streaming ? "Thinking\u2026" : "Thinking");
     gtk_style_context_add_class(gtk_widget_get_style_context(title),
                                 "thinking-label");
