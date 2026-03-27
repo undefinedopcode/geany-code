@@ -120,7 +120,7 @@ static void scroll_to_bottom(ChatViewPrivate *priv)
 /* ── Markdown → Pango conversion ─────────────────────────────────── */
 
 /* Segment types for markdown splitting */
-typedef enum { SEG_TEXT, SEG_CODE } SegType;
+typedef enum { SEG_TEXT, SEG_CODE, SEG_TABLE } SegType;
 typedef struct {
     SegType  type;
     gchar   *text;
@@ -175,6 +175,25 @@ static GList *split_segments(const gchar *content)
                 buf = g_string_new("");
                 in_code = FALSE;
             }
+        } else if (!in_code && line[0] == '|') {
+            /* Table row — collect consecutive | lines into a SEG_TABLE */
+            if (buf->len > 0) {
+                Segment *s = g_new0(Segment, 1);
+                s->type = SEG_TEXT;
+                s->text = g_string_free(buf, FALSE);
+                segs = g_list_append(segs, s);
+                buf = g_string_new("");
+            }
+            GString *table_buf = g_string_new(line);
+            while (*(lp + 1) && (*(lp + 1))[0] == '|') {
+                lp++;
+                g_string_append_c(table_buf, '\n');
+                g_string_append(table_buf, *lp);
+            }
+            Segment *s = g_new0(Segment, 1);
+            s->type = SEG_TABLE;
+            s->text = g_string_free(table_buf, FALSE);
+            segs = g_list_append(segs, s);
         } else {
             if (buf->len > 0)
                 g_string_append_c(buf, '\n');
@@ -448,88 +467,6 @@ static gchar *md_to_pango(const gchar *text)
                     continue;
                 }
             }
-        }
-
-        /* Table: collect all consecutive | rows, compute column widths, render */
-        if (line[0] == '|') {
-            /* Collect all table rows starting from current line */
-            GPtrArray *table_rows = g_ptr_array_new();  /* GPtrArray of GPtrArray of gchar* */
-            GArray *is_sep_row = g_array_new(FALSE, FALSE, sizeof(gboolean));
-            gint num_cols = 0;
-
-            for (gchar **tp = lp; *tp && (*tp)[0] == '|'; tp++) {
-                gboolean sep = is_table_separator(*tp);
-                g_array_append_val(is_sep_row, sep);
-                if (!sep) {
-                    GPtrArray *cells = split_table_row(*tp);
-                    if ((gint)cells->len > num_cols)
-                        num_cols = cells->len;
-                    g_ptr_array_add(table_rows, cells);
-                } else {
-                    g_ptr_array_add(table_rows, NULL);  /* placeholder for separator */
-                }
-            }
-
-            /* Calculate max visual width per column */
-            gint *col_widths = g_new0(gint, num_cols);
-            for (guint r = 0; r < table_rows->len; r++) {
-                GPtrArray *cells = g_ptr_array_index(table_rows, r);
-                if (!cells) continue;  /* separator row */
-                for (guint c = 0; c < cells->len && (gint)c < num_cols; c++) {
-                    gint vlen = visual_len(g_ptr_array_index(cells, c));
-                    if (vlen > col_widths[c])
-                        col_widths[c] = vlen;
-                }
-            }
-
-            /* Render each row */
-            for (guint r = 0; r < table_rows->len; r++) {
-                if (r > 0) g_string_append_c(out, '\n');
-
-                gboolean sep = g_array_index(is_sep_row, gboolean, r);
-                if (sep) {
-                    /* Separator: draw ─ characters */
-                    g_string_append(out,
-                        "<span foreground=\"#666666\" font_family=\"monospace\">");
-                    for (gint c = 0; c < num_cols; c++) {
-                        if (c > 0) g_string_append(out, "\u2500\u253C\u2500");
-                        for (gint w = 0; w < col_widths[c] + 2; w++)
-                            g_string_append(out, "\u2500");
-                    }
-                    g_string_append(out, "</span>");
-                } else {
-                    GPtrArray *cells = g_ptr_array_index(table_rows, r);
-                    g_string_append(out, "<tt>");
-                    for (gint c = 0; c < num_cols; c++) {
-                        if (c > 0)
-                            g_string_append(out,
-                                " <span foreground=\"#666666\">\u2502</span> ");
-                        const gchar *cell = (cells && (guint)c < cells->len)
-                            ? g_ptr_array_index(cells, c) : "";
-                        gint vlen = visual_len(cell);
-                        gint pad = col_widths[c] - vlen;
-
-                        process_inline(out, cell);
-                        for (gint p = 0; p < pad; p++)
-                            g_string_append_c(out, ' ');
-                    }
-                    g_string_append(out, "</tt>");
-                }
-            }
-
-            /* Advance lp past all table rows */
-            guint table_len = table_rows->len;
-            for (guint r = 0; r < table_rows->len; r++) {
-                GPtrArray *cells = g_ptr_array_index(table_rows, r);
-                if (cells) g_ptr_array_free(cells, TRUE);
-            }
-            g_ptr_array_free(table_rows, TRUE);
-            g_array_free(is_sep_row, TRUE);
-            g_free(col_widths);
-
-            /* Skip past the rows we consumed (lp will be incremented by the for loop) */
-            lp += table_len - 1;
-            continue;
         }
 
         /* Regular line — process inline formatting */
@@ -1205,6 +1142,57 @@ static void render_content(GtkWidget *content_box, const gchar *content,
             gtk_widget_set_margin_top(sv, 4);
             gtk_widget_set_margin_bottom(sv, 4);
             gtk_box_pack_start(GTK_BOX(content_box), sv, FALSE, FALSE, 0);
+        } else if (seg->type == SEG_TABLE && strlen(seg->text) > 0) {
+            /* Render markdown table as GtkGrid */
+            gchar **rows = g_strsplit(seg->text, "\n", -1);
+            gint num_cols = 0;
+            gint grid_row = 0;
+            gboolean header_done = FALSE;
+
+            GtkWidget *grid = gtk_grid_new();
+            gtk_style_context_add_class(gtk_widget_get_style_context(grid),
+                                        "md-table");
+            gtk_widget_set_halign(grid, GTK_ALIGN_START);
+            gtk_widget_set_margin_top(grid, 4);
+            gtk_widget_set_margin_bottom(grid, 4);
+
+            for (gchar **rp = rows; *rp; rp++) {
+                if (is_table_separator(*rp)) {
+                    header_done = TRUE;
+                    continue;
+                }
+                GPtrArray *cells = split_table_row(*rp);
+                if ((gint)cells->len > num_cols)
+                    num_cols = cells->len;
+
+                for (guint c = 0; c < cells->len; c++) {
+                    const gchar *cell_text = g_ptr_array_index(cells, c);
+                    /* Render inline markdown in cell */
+                    GString *cell_pango = g_string_new("");
+                    process_inline(cell_pango, cell_text);
+                    GtkWidget *cell_label = gtk_label_new(NULL);
+                    gtk_label_set_markup(GTK_LABEL(cell_label), cell_pango->str);
+                    g_string_free(cell_pango, TRUE);
+                    gtk_label_set_xalign(GTK_LABEL(cell_label), 0);
+                    gtk_label_set_yalign(GTK_LABEL(cell_label), 0);
+                    gtk_widget_set_valign(cell_label, GTK_ALIGN_START);
+                    gtk_label_set_line_wrap(GTK_LABEL(cell_label), TRUE);
+                    gtk_label_set_selectable(GTK_LABEL(cell_label), TRUE);
+                    gtk_style_context_add_class(
+                        gtk_widget_get_style_context(cell_label), "md-table-cell");
+                    if (!header_done)
+                        gtk_style_context_add_class(
+                            gtk_widget_get_style_context(cell_label),
+                            "md-table-header");
+                    gtk_grid_attach(GTK_GRID(grid), cell_label,
+                                    c, grid_row, 1, 1);
+                }
+                g_ptr_array_free(cells, TRUE);
+                grid_row++;
+            }
+            g_strfreev(rows);
+
+            gtk_box_pack_start(GTK_BOX(content_box), grid, FALSE, FALSE, 0);
         }
     }
 
@@ -1320,6 +1308,10 @@ static const gchar *base_css =
     ".thinking-header:hover { background: alpha(@theme_fg_color, 0.06); }\n"
     ".thinking-body { padding: 6px 10px; }\n"
     ".thinking-label { color: @insensitive_fg_color; font-style: italic; }\n"
+    ".md-table { border: 1px solid alpha(@borders, 0.5); border-radius: 4px; }\n"
+    ".md-table-header { background: alpha(@theme_fg_color, 0.08); "
+    "  font-weight: bold; }\n"
+    ".md-table-cell { padding: 4px 8px; }\n"
     ".perm-btn { padding: 4px 12px; }\n"
     ".perm-card { padding: 10px; border: 2px solid @theme_selected_bg_color; "
     "  border-radius: 8px; background: alpha(@theme_selected_bg_color, 0.06); }\n"
