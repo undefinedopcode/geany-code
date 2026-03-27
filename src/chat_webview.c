@@ -646,6 +646,17 @@ static void get_editor_font(const gchar **out_family, gint *out_size)
     *out_size = cached_size;
 }
 
+/* Copy code block content to clipboard */
+static void on_copy_code_clicked(GtkButton *btn, gpointer data)
+{
+    (void)data;
+    const gchar *code = g_object_get_data(G_OBJECT(btn), "code");
+    if (code) {
+        GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+        gtk_clipboard_set_text(clip, code, -1);
+    }
+}
+
 /* Propagate scroll events from embedded Scintilla widgets to the parent
  * scrolled window so mouse-wheel scrolling works over code blocks. */
 static gboolean on_sci_scroll(GtkWidget *widget, GdkEventScroll *event,
@@ -757,11 +768,11 @@ static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
     g_signal_connect(sci, "scroll-event", G_CALLBACK(on_sci_scroll), NULL);
 
     /* Wrap in a container with rounded corners and matching background */
-    GtkWidget *wrapper = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_style_context_add_class(gtk_widget_get_style_context(wrapper),
+    GtkWidget *bg_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(bg_box),
                                 "code-block");
 
-    /* Store the editor bg color as CSS on the wrapper */
+    /* Store the editor bg color as CSS */
     gint bg = default_bg;
     gchar *css_str = g_strdup_printf(
         ".code-block { background: #%02x%02x%02x; border-radius: 6px; "
@@ -769,17 +780,39 @@ static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
         bg & 0xFF, (bg >> 8) & 0xFF, (bg >> 16) & 0xFF);
     GtkCssProvider *prov = gtk_css_provider_new();
     gtk_css_provider_load_from_data(prov, css_str, -1, NULL);
-    gtk_style_context_add_provider(gtk_widget_get_style_context(wrapper),
+    gtk_style_context_add_provider(gtk_widget_get_style_context(bg_box),
         GTK_STYLE_PROVIDER(prov), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(prov);
     g_free(css_str);
 
-    gtk_box_pack_start(GTK_BOX(wrapper), GTK_WIDGET(sci), TRUE, TRUE, 0);
+    /* GtkOverlay: Scintilla as main child, copy button floated top-right */
+    GtkWidget *overlay = gtk_overlay_new();
+    gtk_container_add(GTK_CONTAINER(overlay), GTK_WIDGET(sci));
+
+    /* Copy button — monochrome symbolic icon */
+    GtkWidget *copy_btn = gtk_button_new();
+    GtkWidget *copy_icon = gtk_image_new_from_icon_name(
+        "edit-copy-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_container_add(GTK_CONTAINER(copy_btn), copy_icon);
+    gtk_button_set_relief(GTK_BUTTON(copy_btn), GTK_RELIEF_NONE);
+    gtk_widget_set_halign(copy_btn, GTK_ALIGN_END);
+    gtk_widget_set_valign(copy_btn, GTK_ALIGN_START);
+    gtk_widget_set_margin_end(copy_btn, 4);
+    gtk_widget_set_margin_top(copy_btn, 2);
+    gtk_widget_set_tooltip_text(copy_btn, "Copy");
+    gtk_widget_set_opacity(copy_btn, 0.4);
+    g_object_set_data_full(G_OBJECT(copy_btn), "code",
+        g_strdup(code ? code : ""), g_free);
+    g_signal_connect(copy_btn, "clicked",
+        G_CALLBACK(on_copy_code_clicked), NULL);
+    gtk_overlay_add_overlay(GTK_OVERLAY(overlay), copy_btn);
+
+    gtk_box_pack_start(GTK_BOX(bg_box), overlay, TRUE, TRUE, 0);
 
     /* Store the ScintillaObject so callers can access it for markers etc. */
-    g_object_set_data(G_OBJECT(wrapper), "scintilla", sci);
+    g_object_set_data(G_OBJECT(bg_box), "scintilla", sci);
 
-    return wrapper;
+    return bg_box;
 }
 
 /* Parse numbered line content: strip "  N→" or "  N\t" prefixes.
