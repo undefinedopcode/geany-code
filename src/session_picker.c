@@ -143,6 +143,12 @@ static void parse_session_jsonl(const gchar *filepath, SessionInfo *info)
                             }
                         }
                     }
+
+                    /* Skip CLI-injected messages (XML tags like <context>) */
+                    if (info->first_message && info->first_message[0] == '<') {
+                        g_free(info->first_message);
+                        info->first_message = NULL;
+                    }
                 }
             }
         }
