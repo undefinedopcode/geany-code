@@ -742,17 +742,44 @@ static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
         scintilla_send_message(sci, SCI_STYLESETSIZE, s, chat_font_size);
     }
 
-    /* Size based on line count (recalc after font change) */
+    /* Horizontal text padding inside the editor area */
+    scintilla_send_message(sci, SCI_SETMARGINLEFT, 0, 8);
+    scintilla_send_message(sci, SCI_SETMARGINRIGHT, 0, 8);
+
+    /* Size to exact content height — wrapper provides vertical padding */
     gint line_count = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
     gint line_height = scintilla_send_message(sci, SCI_TEXTHEIGHT, 0, 0);
     if (line_height < 14) line_height = 14;
-    gint height = MIN(line_count * line_height + 8, 400);
+    gint height = MIN(line_count * line_height + 2, 400);
     gtk_widget_set_size_request(GTK_WIDGET(sci), -1, height);
 
     /* Forward scroll events to parent so chat view scrolls freely */
     g_signal_connect(sci, "scroll-event", G_CALLBACK(on_sci_scroll), NULL);
 
-    return GTK_WIDGET(sci);
+    /* Wrap in a container with rounded corners and matching background */
+    GtkWidget *wrapper = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(wrapper),
+                                "code-block");
+
+    /* Store the editor bg color as CSS on the wrapper */
+    gint bg = default_bg;
+    gchar *css_str = g_strdup_printf(
+        ".code-block { background: #%02x%02x%02x; border-radius: 6px; "
+        "padding: 4px 0; }",
+        bg & 0xFF, (bg >> 8) & 0xFF, (bg >> 16) & 0xFF);
+    GtkCssProvider *prov = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(prov, css_str, -1, NULL);
+    gtk_style_context_add_provider(gtk_widget_get_style_context(wrapper),
+        GTK_STYLE_PROVIDER(prov), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(prov);
+    g_free(css_str);
+
+    gtk_box_pack_start(GTK_BOX(wrapper), GTK_WIDGET(sci), TRUE, TRUE, 0);
+
+    /* Store the ScintillaObject so callers can access it for markers etc. */
+    g_object_set_data(G_OBJECT(wrapper), "scintilla", sci);
+
+    return wrapper;
 }
 
 /* Parse numbered line content: strip "  N→" or "  N\t" prefixes.
@@ -918,7 +945,7 @@ static GtkWidget *create_diff_source_view(const gchar *old_s,
 
     /* Create language-highlighted widget */
     GtkWidget *sv = create_source_view_for_file(buf->str, file_path, FALSE);
-    ScintillaObject *sci = SCINTILLA(sv);
+    ScintillaObject *sci = g_object_get_data(G_OBJECT(sv), "scintilla");
 
     scintilla_send_message(sci, SCI_SETREADONLY, 0, 0);
 
@@ -1143,11 +1170,9 @@ static void render_content(GtkWidget *content_box, const gchar *content,
             g_free(pango);
         } else if (seg->type == SEG_CODE && strlen(seg->text) > 0) {
             GtkWidget *sv = create_source_view(seg->text, seg->lang, FALSE);
-            GtkWidget *frame = gtk_frame_new(NULL);
-            gtk_container_add(GTK_CONTAINER(frame), sv);
-            gtk_widget_set_margin_top(frame, 4);
-            gtk_widget_set_margin_bottom(frame, 4);
-            gtk_box_pack_start(GTK_BOX(content_box), frame, FALSE, FALSE, 0);
+            gtk_widget_set_margin_top(sv, 4);
+            gtk_widget_set_margin_bottom(sv, 4);
+            gtk_box_pack_start(GTK_BOX(content_box), sv, FALSE, FALSE, 0);
         }
     }
 
