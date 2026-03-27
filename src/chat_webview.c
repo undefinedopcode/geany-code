@@ -242,7 +242,7 @@ static void process_inline(GString *out, const gchar *line)
                 continue;
             }
         }
-        /* Inline code: `text` — with dimmed background, editor font, padding */
+        /* Inline code: `text` — with dimmed background and editor font */
         if (p[0] == '`' && p[1] != '`') {
             const gchar *end = strchr(p + 1, '`');
             if (end) {
@@ -252,11 +252,10 @@ static void process_inline(GString *out, const gchar *line)
                 gint code_size = fs > 2 ? fs - 2 : fs;
                 g_string_append_printf(out,
                     "<span background=\"#00000040\" font_family=\"%s\" "
-                    "font_size=\"%dpt\">"
-                    "\u2009",  /* thin space padding left */
+                    "font_size=\"%dpt\">",
                     ff, code_size);
                 g_string_append_len(out, p + 1, end - (p + 1));
-                g_string_append(out, "\u2009</span>");  /* thin space padding right */
+                g_string_append(out, "</span>");
                 p = end + 1;
                 continue;
             }
