@@ -60,19 +60,24 @@ static void on_mcp_question(const gchar *request_id,
                                        request_id, questions_json);
 }
 
-/* ── Window-level Alt+V for image paste ───────────────────────────── */
+/* ── Intercept Ctrl+V / Alt+V for paste in chat input ────────────── */
 
-static gboolean on_window_key_press(GtkWidget *window, GdkEventKey *event,
-                                    gpointer data)
+/* Connected via plugin_signal_connect to geany_data->object "key-press".
+ * This fires BEFORE Geany's keybinding loop, so we can claim Ctrl+V
+ * when our chat input has focus.  Returning TRUE tells Geany "handled"
+ * and prevents keybinding processing. */
+static gboolean on_geany_key_press(GObject *obj, GdkEventKey *event,
+                                   gpointer data)
 {
-    (void)window; (void)data;
-
-    /* Only intercept Alt+V */
-    if (!((event->keyval == GDK_KEY_v || event->keyval == GDK_KEY_V) &&
-          (event->state & GDK_MOD1_MASK)))
-        return FALSE;
+    (void)obj; (void)data;
 
     if (!geany_code || !geany_code->chat_widget)
+        return FALSE;
+
+    guint mod = event->state & gtk_accelerator_get_default_mod_mask();
+    gboolean is_paste = (event->keyval == GDK_KEY_v || event->keyval == GDK_KEY_V) &&
+                        (mod == GDK_CONTROL_MASK || mod == GDK_MOD1_MASK);
+    if (!is_paste)
         return FALSE;
 
     GtkWidget *focus = gtk_window_get_focus(
@@ -80,14 +85,14 @@ static gboolean on_window_key_press(GtkWidget *window, GdkEventKey *event,
     if (!focus || !gtk_widget_is_ancestor(focus, geany_code->chat_widget))
         return FALSE;
 
-    /* Our input has focus — check for image */
+    /* Our input has focus — check for image first */
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     if (gtk_clipboard_wait_is_image_available(cb)) {
         chat_widget_paste_image(geany_code->chat_widget);
         return TRUE;
     }
 
-    /* Text paste via Alt+V */
+    /* Text paste */
     if (GTK_IS_TEXT_VIEW(focus)) {
         GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(focus));
         gtk_text_buffer_paste_clipboard(buf, cb, NULL, TRUE);
@@ -206,9 +211,11 @@ static gboolean gc_init(GeanyPlugin *plugin, gpointer pdata)
                          GDK_KEY_a, GDK_MOD1_MASK,
                          "add_context", "Add Selection to Claude Context", NULL);
 
-    /* Hook Alt+V for paste in our input */
-    g_signal_connect(geany->main_widgets->window, "key-press-event",
-                     G_CALLBACK(on_window_key_press), NULL);
+    /* Hook Ctrl+V / Alt+V for paste in our input — fires before Geany's
+     * keybinding loop so we can intercept Ctrl+V.  Auto-disconnects on
+     * plugin unload. */
+    plugin_signal_connect(plugin, geany_data->object, "key-press", FALSE,
+                          G_CALLBACK(on_geany_key_press), NULL);
 
     return TRUE;
 }
@@ -233,9 +240,7 @@ static void gc_cleanup(GeanyPlugin *plugin, gpointer pdata)
                 GTK_NOTEBOOK(geany->main_widgets->message_window_notebook), page);
     }
 
-    /* Disconnect window key handler */
-    g_signal_handlers_disconnect_by_func(geany->main_widgets->window,
-                                         on_window_key_press, NULL);
+    /* plugin_signal_connect auto-disconnects on unload — no manual cleanup */
 
     /* Remove menu item */
     if (geany_code->menu_item)

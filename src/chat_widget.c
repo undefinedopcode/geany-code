@@ -832,7 +832,18 @@ static void on_jump_to_edit(const gchar *file_path,
                             gint start_line, gint end_line,
                             gpointer user_data)
 {
-    (void)user_data;
+    ChatWidgetPrivate *priv = user_data;
+
+    /* Grep results use paths relative to the project root — resolve them */
+    if (file_path && file_path[0] != '/') {
+        const gchar *wd = cli_session_get_working_dir(priv->session);
+        if (wd) {
+            gchar *abs = g_build_filename(wd, file_path, NULL);
+            editor_bridge_jump_to(abs, start_line, end_line);
+            g_free(abs);
+            return;
+        }
+    }
     editor_bridge_jump_to(file_path, start_line, end_line);
 }
 

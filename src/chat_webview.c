@@ -70,6 +70,45 @@ static ChatViewPrivate *get_priv(GtkWidget *w)
     return g_object_get_data(G_OBJECT(w), PRIV_KEY);
 }
 
+/* ── Width-change diagnostic ─────────────────────────────────────── */
+
+/* Call WIDTH_DIAG_BEFORE(priv) before adding a widget, and
+ * WIDTH_DIAG_AFTER(priv, "description") after.  If the outer_box
+ * allocation grew, a line is printed to the Messages tab. */
+#define WIDTH_DIAG_BEFORE(priv) \
+    gint _wd_before = gtk_widget_get_allocated_width((priv)->outer_box)
+
+#define WIDTH_DIAG_AFTER(priv, what) do { \
+    gint _wd_after = gtk_widget_get_allocated_width((priv)->outer_box); \
+    if (_wd_after != _wd_before) \
+        msgwin_msg_add(COLOR_RED, -1, NULL, \
+            "[width-diag] %s: outer_box %d -> %d (delta %+d)", \
+            (what), _wd_before, _wd_after, _wd_after - _wd_before); \
+} while (0)
+
+/* Deferred version: checks after GTK has had a chance to relayout */
+typedef struct { GtkWidget *outer_box; gint before; gchar *desc; } WidthDiagData;
+static gboolean width_diag_idle_cb(gpointer p)
+{
+    WidthDiagData *d = p;
+    gint after = gtk_widget_get_allocated_width(d->outer_box);
+    if (after != d->before)
+        msgwin_msg_add(COLOR_RED, -1, NULL,
+            "[width-diag] %s: outer_box %d -> %d (delta %+d)",
+            d->desc, d->before, after, after - d->before);
+    g_free(d->desc);
+    g_free(d);
+    return G_SOURCE_REMOVE;
+}
+
+#define WIDTH_DIAG_AFTER_IDLE(priv, what) do { \
+    WidthDiagData *_d = g_new0(WidthDiagData, 1); \
+    _d->outer_box = (priv)->outer_box; \
+    _d->before = _wd_before; \
+    _d->desc = g_strdup(what); \
+    g_idle_add(width_diag_idle_cb, _d); \
+} while (0)
+
 /* ── Cleanup helpers ─────────────────────────────────────────────── */
 
 static void free_message_entry(gpointer p)
@@ -593,6 +632,25 @@ static void on_copy_code_clicked(GtkButton *btn, gpointer data)
     }
 }
 
+/* Recalculate Scintilla height after allocation, accounting for word-wrap.
+ * At creation time we only know document lines; once allocated a real width,
+ * SCI_WRAPCOUNT tells us how many display lines each document line occupies. */
+static void on_sci_size_allocate(GtkWidget *widget, GdkRectangle *alloc,
+                                  gpointer data)
+{
+    (void)data;
+    ScintillaObject *sci = SCINTILLA(widget);
+    gint doc_lines = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
+    gint visual_lines = 0;
+    for (gint i = 0; i < doc_lines; i++)
+        visual_lines += scintilla_send_message(sci, SCI_WRAPCOUNT, i, 0);
+    gint line_height = scintilla_send_message(sci, SCI_TEXTHEIGHT, 0, 0);
+    if (line_height < 14) line_height = 14;
+    gint needed = MIN(visual_lines * line_height + 4, 600);
+    if (needed != alloc->height)
+        gtk_widget_set_size_request(widget, -1, needed);
+}
+
 /* Propagate scroll events from embedded Scintilla widgets to the parent
  * scrolled window so mouse-wheel scrolling works over code blocks. */
 static gboolean on_sci_scroll(GtkWidget *widget, GdkEventScroll *event,
@@ -693,12 +751,15 @@ static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
     scintilla_send_message(sci, SCI_SETMARGINLEFT, 0, 8);
     scintilla_send_message(sci, SCI_SETMARGINRIGHT, 0, 8);
 
-    /* Size to exact content height — wrapper provides vertical padding */
+    /* Initial height estimate from document line count (before wrap) */
     gint line_count = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
     gint line_height = scintilla_send_message(sci, SCI_TEXTHEIGHT, 0, 0);
     if (line_height < 14) line_height = 14;
-    gint height = MIN(line_count * line_height + 2, 400);
+    gint height = MIN(line_count * line_height + 4, 600);
     gtk_widget_set_size_request(GTK_WIDGET(sci), -1, height);
+
+    /* Recalculate height once allocated width is known (wrapping may add lines) */
+    g_signal_connect(sci, "size-allocate", G_CALLBACK(on_sci_size_allocate), NULL);
 
     /* Forward scroll events to parent so chat view scrolls freely */
     g_signal_connect(sci, "scroll-event", G_CALLBACK(on_sci_scroll), NULL);
@@ -1025,6 +1086,7 @@ static GtkWidget *render_grep_result(const gchar *result,
              * or other unstructured output. Show as-is. */
             GtkWidget *lbl = gtk_label_new(line);
             gtk_label_set_xalign(GTK_LABEL(lbl), 0);
+            gtk_label_set_line_wrap(GTK_LABEL(lbl), TRUE);
             gtk_label_set_selectable(GTK_LABEL(lbl), TRUE);
             PangoFontDescription *mono = pango_font_description_from_string("monospace 10");
             gtk_widget_override_font(lbl, mono);
@@ -1043,8 +1105,10 @@ static GtkWidget *render_grep_result(const gchar *result,
         gtk_button_set_relief(GTK_BUTTON(file_btn), GTK_RELIEF_NONE);
         gtk_widget_set_halign(file_btn, GTK_ALIGN_START);
 
-        /* Style the label inside the button */
+        /* Style the label inside the button — ellipsize long paths */
         GtkWidget *btn_label = gtk_bin_get_child(GTK_BIN(file_btn));
+        gtk_label_set_ellipsize(GTK_LABEL(btn_label), PANGO_ELLIPSIZE_START);
+        gtk_label_set_max_width_chars(GTK_LABEL(btn_label), 60);
         PangoAttrList *attrs = pango_attr_list_new();
         pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
         pango_attr_list_insert(attrs,
@@ -1177,6 +1241,10 @@ static void render_content(GtkWidget *content_box, const gchar *content,
                     gtk_label_set_yalign(GTK_LABEL(cell_label), 0);
                     gtk_widget_set_valign(cell_label, GTK_ALIGN_START);
                     gtk_label_set_line_wrap(GTK_LABEL(cell_label), TRUE);
+                    gtk_label_set_line_wrap_mode(GTK_LABEL(cell_label),
+                                                 PANGO_WRAP_WORD_CHAR);
+                    gtk_label_set_max_width_chars(GTK_LABEL(cell_label), 1);
+                    gtk_widget_set_hexpand(cell_label, TRUE);
                     gtk_label_set_selectable(GTK_LABEL(cell_label), TRUE);
                     gtk_style_context_add_class(
                         gtk_widget_get_style_context(cell_label), "md-table-cell");
@@ -1366,6 +1434,10 @@ GtkWidget *chat_webview_new(void)
     priv->scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(priv->scroll),
         GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    /* Prevent the scrolled window from requesting extra width based on
+     * child content — the viewport clips to whatever width we're given. */
+    gtk_scrolled_window_set_propagate_natural_width(
+        GTK_SCROLLED_WINDOW(priv->scroll), FALSE);
 
     priv->outer_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
@@ -1417,6 +1489,7 @@ void chat_webview_add_message(GtkWidget *webview,
     (void)timestamp;
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
+    WIDTH_DIAG_BEFORE(priv);
 
     /* Hide welcome on first message */
     if (priv->welcome && gtk_widget_get_visible(priv->welcome))
@@ -1455,6 +1528,9 @@ void chat_webview_add_message(GtkWidget *webview,
     gtk_widget_show_all(row);
 
     g_hash_table_insert(priv->msg_widgets, g_strdup(id), me);
+    { gchar *_desc = g_strdup_printf("add_message(role=%s)", role);
+      WIDTH_DIAG_AFTER_IDLE(priv, _desc);
+      g_free(_desc); }
     scroll_to_bottom(priv);
 }
 
@@ -1474,10 +1550,12 @@ void chat_webview_update_message(GtkWidget *webview,
         !is_streaming)
         return;
 
+    WIDTH_DIAG_BEFORE(priv);
     render_content(me->content_box, content, me->role, is_streaming);
     g_free(me->last_content);
     me->last_content = g_strdup(content ? content : "");
 
+    WIDTH_DIAG_AFTER_IDLE(priv, "update_message");
     scroll_to_bottom(priv);
 }
 
@@ -1531,6 +1609,7 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     (void)msg_id;
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
+    WIDTH_DIAG_BEFORE(priv);
 
     /* Result update for existing tool */
     ToolEntry *existing = g_hash_table_lookup(priv->tool_widgets, tool_id);
@@ -1582,6 +1661,9 @@ void chat_webview_add_tool_call(GtkWidget *webview,
             gtk_box_pack_start(GTK_BOX(existing->body_box), result_widget, FALSE, FALSE, 0);
             gtk_widget_show_all(result_widget);
         }
+        { gchar *_desc = g_strdup_printf("tool_result(%s)", existing->tool_name);
+          WIDTH_DIAG_AFTER_IDLE(priv, _desc);
+          g_free(_desc); }
         scroll_to_bottom(priv);
         return;
     }
@@ -1761,6 +1843,9 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     g_hash_table_insert(priv->tool_widgets, g_strdup(tool_id), te);
     g_object_unref(jp);
 
+    { gchar *_desc = g_strdup_printf("add_tool(%s)", tool_name);
+      WIDTH_DIAG_AFTER_IDLE(priv, _desc);
+      g_free(_desc); }
     scroll_to_bottom(priv);
 }
 
@@ -1784,6 +1869,7 @@ void chat_webview_add_thinking(GtkWidget *webview,
 {
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
+    WIDTH_DIAG_BEFORE(priv);
 
     gchar *key = g_strdup_printf("%s:%u", msg_id, fragment_index);
 
@@ -1869,6 +1955,7 @@ void chat_webview_add_thinking(GtkWidget *webview,
     gtk_widget_show_all(row);
 
     g_hash_table_insert(priv->thinking_widgets, key, te);
+    WIDTH_DIAG_AFTER_IDLE(priv, "add_thinking");
     scroll_to_bottom(priv);
 }
 
@@ -1902,6 +1989,7 @@ void chat_webview_show_permission(GtkWidget *webview,
 {
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
+    WIDTH_DIAG_BEFORE(priv);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_style_context_add_class(gtk_widget_get_style_context(box), "perm-card");
@@ -1959,6 +2047,9 @@ void chat_webview_show_permission(GtkWidget *webview,
         gtk_widget_show_all(row);
     }
     g_object_unref(jp);
+    { gchar *_desc = g_strdup_printf("show_permission(%s)", tool_name);
+      WIDTH_DIAG_AFTER_IDLE(priv, _desc);
+      g_free(_desc); }
     scroll_to_bottom(priv);
 }
 
@@ -2043,6 +2134,7 @@ void chat_webview_show_user_question(GtkWidget *webview,
 {
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
+    WIDTH_DIAG_BEFORE(priv);
 
     JsonParser *jp = json_parser_new();
     if (!json_parser_load_from_data(jp, questions_json, -1, NULL)) {
@@ -2128,6 +2220,7 @@ void chat_webview_show_user_question(GtkWidget *webview,
     gtk_widget_show_all(row);
 
     g_object_unref(jp);
+    WIDTH_DIAG_AFTER_IDLE(priv, "show_user_question");
     scroll_to_bottom(priv);
 }
 
@@ -2137,6 +2230,7 @@ void chat_webview_update_todos(GtkWidget *webview, const gchar *todos_json)
 {
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
+    WIDTH_DIAG_BEFORE(priv);
 
     /* Clear existing todos */
     GList *children = gtk_container_get_children(GTK_CONTAINER(priv->todos_box));
@@ -2219,6 +2313,7 @@ void chat_webview_update_todos(GtkWidget *webview, const gchar *todos_json)
     gtk_widget_set_no_show_all(priv->todos_box, FALSE);
     gtk_widget_show_all(priv->todos_box);
     g_object_unref(jp);
+    WIDTH_DIAG_AFTER_IDLE(priv, "update_todos");
 }
 
 /* ── History ─────────────────────────────────────────────────────── */
