@@ -27,4 +27,9 @@ const gchar *settings_get_permission_mode(GeanyCodeSettings *settings);
 void         settings_set_permission_mode(GeanyCodeSettings *settings,
                                           const gchar *mode);
 
+/* Diff color scheme: "green-red" (default), "blue-red", "purple-orange" */
+const gchar *settings_get_diff_colors(GeanyCodeSettings *settings);
+void         settings_set_diff_colors(GeanyCodeSettings *settings,
+                                      const gchar *scheme);
+
 #endif /* GEANY_CODE_SETTINGS_H */

@@ -8,6 +8,7 @@ struct _GeanyCodeSettings {
 
     gchar    *claude_path;
     gchar    *permission_mode;
+    gchar    *diff_colors;
 };
 
 static gchar *get_config_dir(void)
@@ -28,6 +29,7 @@ GeanyCodeSettings *settings_new(void)
     /* Defaults */
     s->claude_path = g_strdup("claude");
     s->permission_mode = g_strdup("approve-edits");
+    s->diff_colors = g_strdup("green-red");
 
     return s;
 }
@@ -39,6 +41,7 @@ void settings_free(GeanyCodeSettings *settings)
     g_free(settings->config_path);
     g_free(settings->claude_path);
     g_free(settings->permission_mode);
+    g_free(settings->diff_colors);
     g_free(settings);
 }
 
@@ -57,6 +60,10 @@ void settings_load(GeanyCodeSettings *settings)
     val = g_key_file_get_string(settings->keyfile, "general",
                                 "permission_mode", NULL);
     if (val) { g_free(settings->permission_mode); settings->permission_mode = val; }
+
+    val = g_key_file_get_string(settings->keyfile, "general",
+                                "diff_colors", NULL);
+    if (val) { g_free(settings->diff_colors); settings->diff_colors = val; }
 }
 
 void settings_save(GeanyCodeSettings *settings)
@@ -65,6 +72,8 @@ void settings_save(GeanyCodeSettings *settings)
                           "claude_path", settings->claude_path);
     g_key_file_set_string(settings->keyfile, "general",
                           "permission_mode", settings->permission_mode);
+    g_key_file_set_string(settings->keyfile, "general",
+                          "diff_colors", settings->diff_colors);
 
     /* Ensure directory exists */
     gchar *dir = g_path_get_dirname(settings->config_path);
@@ -94,4 +103,15 @@ void settings_set_permission_mode(GeanyCodeSettings *settings, const gchar *mode
 {
     g_free(settings->permission_mode);
     settings->permission_mode = g_strdup(mode);
+}
+
+const gchar *settings_get_diff_colors(GeanyCodeSettings *settings)
+{
+    return settings->diff_colors;
+}
+
+void settings_set_diff_colors(GeanyCodeSettings *settings, const gchar *scheme)
+{
+    g_free(settings->diff_colors);
+    settings->diff_colors = g_strdup(scheme);
 }

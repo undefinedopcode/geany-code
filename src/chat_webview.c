@@ -633,12 +633,13 @@ static void on_copy_code_clicked(GtkButton *btn, gpointer data)
 }
 
 /* Recalculate Scintilla height after allocation, accounting for word-wrap.
- * At creation time we only know document lines; once allocated a real width,
- * SCI_WRAPCOUNT tells us how many display lines each document line occupies. */
-static void on_sci_size_allocate(GtkWidget *widget, GdkRectangle *alloc,
-                                  gpointer data)
+ * Deferred to idle because Scintilla may not finish wrapping until after
+ * the size-allocate (it can defer wrap to paint).  SCI_WRAPCOUNT returns
+ * stale data during size-allocate on the first layout pass, which is why
+ * collapsing and re-expanding a tool card previously fixed the height. */
+static gboolean sci_recalc_height_idle(gpointer data)
 {
-    (void)data;
+    GtkWidget *widget = GTK_WIDGET(data);
     ScintillaObject *sci = SCINTILLA(widget);
     gint doc_lines = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
     gint visual_lines = 0;
@@ -647,8 +648,18 @@ static void on_sci_size_allocate(GtkWidget *widget, GdkRectangle *alloc,
     gint line_height = scintilla_send_message(sci, SCI_TEXTHEIGHT, 0, 0);
     if (line_height < 14) line_height = 14;
     gint needed = MIN(visual_lines * line_height + 4, 600);
-    if (needed != alloc->height)
+    gint current = gtk_widget_get_allocated_height(widget);
+    if (needed != current)
         gtk_widget_set_size_request(widget, -1, needed);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_sci_size_allocate(GtkWidget *widget, GdkRectangle *alloc,
+                                  gpointer data)
+{
+    (void)alloc; (void)data;
+    /* Schedule recalc after Scintilla finishes its internal layout */
+    g_idle_add(sci_recalc_height_idle, widget);
 }
 
 /* Propagate scroll events from embedded Scintilla widgets to the parent
@@ -979,14 +990,27 @@ static GtkWidget *create_diff_source_view(const gchar *old_s,
 
     scintilla_send_message(sci, SCI_SETREADONLY, 0, 0);
 
-    /* Marker 0 = removed (red), Marker 1 = added (green) */
+    /* Diff marker colors (BGR format) based on user preference */
+    guint32 color_removed = 0x5555CC; /* red */
+    guint32 color_added   = 0x55CC55; /* green */
+    if (geany_code && geany_code->settings) {
+        const gchar *scheme = settings_get_diff_colors(geany_code->settings);
+        if (g_strcmp0(scheme, "blue-red") == 0) {
+            color_removed = 0x5555CC; /* red (BGR) */
+            color_added   = 0xCC5555; /* blue (BGR) */
+        } else if (g_strcmp0(scheme, "purple-orange") == 0) {
+            color_removed = 0x1478DC; /* orange (BGR: R=DC G=78 B=14) */
+            color_added   = 0xCC5580; /* purple (BGR) */
+        }
+    }
+
     scintilla_send_message(sci, SCI_MARKERDEFINE, 0, SC_MARK_BACKGROUND);
-    scintilla_send_message(sci, SCI_MARKERSETBACK, 0, 0x5555CC); /* red (BGR) */
-    scintilla_send_message(sci, SCI_MARKERSETALPHA, 0, 40);
+    scintilla_send_message(sci, SCI_MARKERSETBACK, 0, color_removed);
+    scintilla_send_message(sci, SCI_MARKERSETALPHA, 0, 80);
 
     scintilla_send_message(sci, SCI_MARKERDEFINE, 1, SC_MARK_BACKGROUND);
-    scintilla_send_message(sci, SCI_MARKERSETBACK, 1, 0x55CC55); /* green (BGR) */
-    scintilla_send_message(sci, SCI_MARKERSETALPHA, 1, 40);
+    scintilla_send_message(sci, SCI_MARKERSETBACK, 1, color_added);
+    scintilla_send_message(sci, SCI_MARKERSETALPHA, 1, 80);
 
     /* Apply markers per line */
     for (guint i = 0; i < markers->len; i++) {
@@ -1213,21 +1237,51 @@ static void render_content(GtkWidget *content_box, const gchar *content,
             gint grid_row = 0;
             gboolean header_done = FALSE;
 
+            /* First pass: measure max content length per column */
+            gint col_widths[64] = {0};
+            for (gchar **rp = rows; *rp; rp++) {
+                if (is_table_separator(*rp))
+                    continue;
+                GPtrArray *cells = split_table_row(*rp);
+                if ((gint)cells->len > num_cols)
+                    num_cols = MIN((gint)cells->len, 64);
+                for (guint c = 0; c < cells->len && c < 64; c++) {
+                    gint len = (gint)g_utf8_strlen(
+                        g_ptr_array_index(cells, c), -1);
+                    if (len > col_widths[c])
+                        col_widths[c] = len;
+                }
+                g_ptr_array_free(cells, TRUE);
+            }
+            /* Find the widest column to decide which columns expand */
+            gint max_col_width = 0;
+            for (gint i = 0; i < num_cols; i++) {
+                if (col_widths[i] > max_col_width)
+                    max_col_width = col_widths[i];
+            }
+            gint avg_col_width = 0;
+            if (num_cols > 0) {
+                gint total = 0;
+                for (gint i = 0; i < num_cols; i++)
+                    total += col_widths[i];
+                avg_col_width = total / num_cols;
+            }
+
             GtkWidget *grid = gtk_grid_new();
             gtk_style_context_add_class(gtk_widget_get_style_context(grid),
                                         "md-table");
-            gtk_widget_set_halign(grid, GTK_ALIGN_START);
+            gtk_widget_set_halign(grid, GTK_ALIGN_FILL);
             gtk_widget_set_margin_top(grid, 4);
             gtk_widget_set_margin_bottom(grid, 4);
 
+            /* Second pass: create widgets */
+            header_done = FALSE;
             for (gchar **rp = rows; *rp; rp++) {
                 if (is_table_separator(*rp)) {
                     header_done = TRUE;
                     continue;
                 }
                 GPtrArray *cells = split_table_row(*rp);
-                if ((gint)cells->len > num_cols)
-                    num_cols = cells->len;
 
                 for (guint c = 0; c < cells->len; c++) {
                     const gchar *cell_text = g_ptr_array_index(cells, c);
@@ -1243,8 +1297,14 @@ static void render_content(GtkWidget *content_box, const gchar *content,
                     gtk_label_set_line_wrap(GTK_LABEL(cell_label), TRUE);
                     gtk_label_set_line_wrap_mode(GTK_LABEL(cell_label),
                                                  PANGO_WRAP_WORD_CHAR);
-                    gtk_label_set_max_width_chars(GTK_LABEL(cell_label), 1);
-                    gtk_widget_set_hexpand(cell_label, TRUE);
+                    /* Wide columns expand and wrap; narrow ones keep natural size */
+                    gboolean is_wide = c < 64 &&
+                        col_widths[c] > avg_col_width;
+                    if (is_wide) {
+                        gtk_label_set_max_width_chars(
+                            GTK_LABEL(cell_label), col_widths[c]);
+                        gtk_widget_set_hexpand(cell_label, TRUE);
+                    }
                     gtk_label_set_selectable(GTK_LABEL(cell_label), TRUE);
                     gtk_style_context_add_class(
                         gtk_widget_get_style_context(cell_label), "md-table-cell");
@@ -1260,7 +1320,7 @@ static void render_content(GtkWidget *content_box, const gchar *content,
             }
             g_strfreev(rows);
 
-            gtk_box_pack_start(GTK_BOX(content_box), grid, FALSE, FALSE, 0);
+            gtk_box_pack_start(GTK_BOX(content_box), grid, FALSE, TRUE, 0);
         }
     }
 

@@ -2,6 +2,7 @@
 #define GEANY_CODE_PLUGIN_H
 
 #include <geanyplugin.h>
+#include "settings.h"
 
 /* Geany globals (defined in plugin.c) */
 extern GeanyPlugin *geany_plugin;
@@ -19,6 +20,9 @@ struct _GeanyCodePlugin {
     /* Menu items (so we can destroy on cleanup) */
     GtkWidget    *menu_item;
     GtkWidget    *submenu;
+
+    /* Settings */
+    GeanyCodeSettings *settings;
 };
 
 /* The single global plugin instance */

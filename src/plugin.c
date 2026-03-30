@@ -148,6 +148,10 @@ static gboolean gc_init(GeanyPlugin *plugin, gpointer pdata)
     geany_code = g_new0(GeanyCodePlugin, 1);
     geany_code->geany_plugin = plugin;
 
+    /* Load settings */
+    geany_code->settings = settings_new();
+    settings_load(geany_code->settings);
+
     /* Start DBus service for MCP server */
     editor_dbus_start();
     editor_dbus_set_question_callback(on_mcp_question, NULL);
@@ -227,6 +231,12 @@ static void gc_cleanup(GeanyPlugin *plugin, gpointer pdata)
     if (!geany_code)
         return;
 
+    /* Save and free settings */
+    if (geany_code->settings) {
+        settings_save(geany_code->settings);
+        settings_free(geany_code->settings);
+    }
+
     /* Stop DBus service */
     editor_dbus_stop();
 
@@ -250,6 +260,17 @@ static void gc_cleanup(GeanyPlugin *plugin, gpointer pdata)
     geany_code = NULL;
 }
 
+static void on_diff_colors_changed(GtkComboBox *combo, gpointer user_data)
+{
+    (void)user_data;
+    gint active = gtk_combo_box_get_active(combo);
+    const gchar *schemes[] = { "green-red", "blue-red", "purple-orange" };
+    if (active >= 0 && active < 3) {
+        settings_set_diff_colors(geany_code->settings, schemes[active]);
+        settings_save(geany_code->settings);
+    }
+}
+
 static GtkWidget *gc_configure(GeanyPlugin *plugin, GtkDialog *dialog,
                                gpointer pdata)
 {
@@ -258,11 +279,32 @@ static GtkWidget *gc_configure(GeanyPlugin *plugin, GtkDialog *dialog,
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(vbox), 6);
 
-    GtkWidget *label = gtk_label_new(
-        "Claude Code integration for Geany.\n\n"
-        "Configuration options will be added here.");
-    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
-    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    /* Diff color scheme */
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *label = gtk_label_new("Diff colors:");
+    gtk_box_pack_start(GTK_BOX(hbox), label, FALSE, FALSE, 0);
+
+    GtkWidget *combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo),
+                                   "Green / Red (default)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo),
+                                   "Blue / Red");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo),
+                                   "Purple / Orange");
+
+    const gchar *current = settings_get_diff_colors(geany_code->settings);
+    if (g_strcmp0(current, "blue-red") == 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 1);
+    else if (g_strcmp0(current, "purple-orange") == 0)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 2);
+    else
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
+
+    g_signal_connect(combo, "changed",
+                     G_CALLBACK(on_diff_colors_changed), NULL);
+    gtk_box_pack_start(GTK_BOX(hbox), combo, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
 
     gtk_widget_show_all(vbox);
     return vbox;

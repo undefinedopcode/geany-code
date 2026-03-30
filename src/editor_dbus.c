@@ -116,6 +116,13 @@ static GeanyDocument *ensure_document(const gchar *file_path)
         GeanyDocument *doc = g_ptr_array_index(geany_data->documents_array, i);
         if (doc && doc->is_valid && doc->file_name &&
             g_strcmp0(doc->file_name, file_path) == 0) {
+            /* Switch to the tab so the file is visible */
+            gint page = document_get_notebook_page(doc);
+            if (page >= 0) {
+                GtkNotebook *nb = GTK_NOTEBOOK(
+                    geany_data->main_widgets->notebook);
+                gtk_notebook_set_current_page(nb, page);
+            }
             return doc;
         }
     }
