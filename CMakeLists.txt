@@ -33,6 +33,7 @@ add_library(geany-code SHARED
     src/editor_dbus.c
     src/session_picker.c
     src/settings.c
+    src/hooks_dialog.c
 )
 
 set_target_properties(geany-code PROPERTIES PREFIX "")

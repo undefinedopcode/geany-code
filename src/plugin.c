@@ -3,6 +3,7 @@
 #include "chat_input.h"
 #include "editor_bridge.h"
 #include "editor_dbus.h"
+#include "hooks_dialog.h"
 
 GeanyPlugin    *geany_plugin;
 GeanyData      *geany_data;
@@ -135,6 +136,12 @@ static void on_suggest_improvements(GtkMenuItem *item, gpointer data)
                                  "Suggest improvements for this code");
 }
 
+static void on_manage_hooks(GtkMenuItem *item, gpointer data)
+{
+    (void)item; (void)data;
+    hooks_dialog_run(GTK_WINDOW(geany->main_widgets->window));
+}
+
 /* ── Plugin lifecycle ────────────────────────────────────────────── */
 
 static gboolean gc_init(GeanyPlugin *plugin, gpointer pdata)
@@ -193,6 +200,13 @@ static gboolean gc_init(GeanyPlugin *plugin, gpointer pdata)
 
     item = gtk_menu_item_new_with_label("Add to Context");
     g_signal_connect(item, "activate", G_CALLBACK(on_add_to_context), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(geany_code->submenu), item);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(geany_code->submenu),
+                          gtk_separator_menu_item_new());
+
+    item = gtk_menu_item_new_with_label("Manage Hooks...");
+    g_signal_connect(item, "activate", G_CALLBACK(on_manage_hooks), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(geany_code->submenu), item);
 
     gtk_widget_show_all(geany_code->menu_item);

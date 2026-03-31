@@ -762,11 +762,13 @@ static GtkWidget *create_source_view(const gchar *code, const gchar *lang_hint,
     scintilla_send_message(sci, SCI_SETMARGINLEFT, 0, 8);
     scintilla_send_message(sci, SCI_SETMARGINRIGHT, 0, 8);
 
-    /* Initial height estimate from document line count (before wrap) */
+    /* Initial height estimate from document line count (before wrap).
+     * SCI_TEXTHEIGHT can underreport before the widget is realized, so
+     * add 2px per line as headroom to avoid clipping the last line. */
     gint line_count = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
     gint line_height = scintilla_send_message(sci, SCI_TEXTHEIGHT, 0, 0);
     if (line_height < 14) line_height = 14;
-    gint height = MIN(line_count * line_height + 4, 600);
+    gint height = MIN(line_count * (line_height + 2) + 4, 600);
     gtk_widget_set_size_request(GTK_WIDGET(sci), -1, height);
 
     /* Recalculate height once allocated width is known (wrapping may add lines) */
