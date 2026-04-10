@@ -692,9 +692,27 @@ static void on_send(const gchar *text, gpointer user_data)
     }
     g_free(id);
 
-    /* Send to claude (no implicit file/selection — user adds context explicitly) */
-    cli_session_send_message(priv->session, full_prompt->str,
+    /* On the first message of a session, prepend a hint about Geany's
+     * MCP tools.  This goes to Claude only, not into the chat view. */
+    GString *cli_prompt = NULL;
+    if (priv->msg_counter == 1) {  /* counter was just incremented above */
+        cli_prompt = g_string_new(
+            "<system-reminder>\n"
+            "You are running inside the Geany IDE. Prefer the geanycode_* MCP tools "
+            "over built-in equivalents for file operations:\n"
+            "- Use geanycode_edit instead of Edit (shows changes in the IDE in real time)\n"
+            "- Use geanycode_write instead of Write (opens file in the IDE)\n"
+            "- Use geanycode_read instead of Read (syncs with the IDE)\n"
+            "- Use geanycode_build instead of Bash for builds\n"
+            "- Use geanycode_ask_user instead of AskUserQuestion\n"
+            "</system-reminder>\n\n");
+        g_string_append(cli_prompt, full_prompt->str);
+    }
+
+    cli_session_send_message(priv->session,
+                             cli_prompt ? cli_prompt->str : full_prompt->str,
                              NULL, NULL, images);
+    if (cli_prompt) g_string_free(cli_prompt, TRUE);
     g_list_free_full(images, g_free);
     for (GList *l = contexts; l; l = l->next) {
         ContextChunk *c = l->data;
@@ -801,6 +819,16 @@ static void on_resume_session_btn(GtkButton *btn, gpointer user_data)
         HistoryMessage *hm = l->data;
         gchar *id = g_strdup_printf("hist_%s", hm->uuid);
 
+        /* Skip CLI control messages that aren't real user content */
+        if (hm->content && (
+                strstr(hm->content, "<local-command-caveat>") ||
+                strstr(hm->content, "<command-name>") ||
+                strstr(hm->content, "<local-command-stdout>") ||
+                strstr(hm->content, "<command-message>"))) {
+            g_free(id);
+            continue;
+        }
+
         /* Render text content if present */
         if (hm->content)
             chat_webview_add_history_message(priv->webview, id, hm->role,
@@ -824,6 +852,21 @@ static void on_resume_session_btn(GtkButton *btn, gpointer user_data)
 
     /* Start immediately with --resume */
     ensure_session(priv);
+}
+
+/* ── Export conversation ─────────────────────────────────────────── */
+
+static void on_export_clicked(GtkButton *btn, gpointer user_data)
+{
+    (void)btn;
+    ChatWidgetPrivate *priv = user_data;
+    gchar *md = chat_webview_export_markdown(priv->webview);
+    if (md && md[0] != '\0') {
+        GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+        gtk_clipboard_set_text(clip, md, -1);
+        msgwin_status_add("[geany-code] Conversation copied to clipboard as Markdown");
+    }
+    g_free(md);
 }
 
 /* ── Jump-to-edit callback from web view ─────────────────────────── */
@@ -910,6 +953,13 @@ GtkWidget *chat_widget_new(void)
     g_signal_connect(priv->mcp_indicator, "clicked",
                      G_CALLBACK(on_mcp_indicator_clicked), priv);
 
+    /* Export conversation button (icon) */
+    GtkWidget *export_btn = gtk_button_new_from_icon_name(
+        "edit-copy-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
+    gtk_button_set_relief(GTK_BUTTON(export_btn), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(export_btn, "Copy conversation as Markdown");
+    gtk_box_pack_start(GTK_BOX(header), export_btn, FALSE, FALSE, 0);
+
     /* Resume session button (icon) */
     GtkWidget *resume_btn = gtk_button_new_from_icon_name(
         "document-open-recent", GTK_ICON_SIZE_SMALL_TOOLBAR);
@@ -943,6 +993,8 @@ GtkWidget *chat_widget_new(void)
     gtk_box_pack_start(GTK_BOX(vbox), priv->input, FALSE, FALSE, 4);
 
     /* Wire header buttons */
+    g_signal_connect(export_btn, "clicked",
+                     G_CALLBACK(on_export_clicked), priv);
     g_signal_connect(resume_btn, "clicked",
                      G_CALLBACK(on_resume_session_btn), priv);
     g_signal_connect(new_btn, "clicked",

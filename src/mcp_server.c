@@ -192,6 +192,19 @@ static void handle_initialize(gint64 id)
     json_builder_set_member_name(b, "version");
     json_builder_add_string_value(b, "0.1.0");
     json_builder_end_object(b);
+    json_builder_set_member_name(b, "instructions");
+    json_builder_add_string_value(b,
+        "You are connected to the Geany IDE via MCP. "
+        "Prefer the geanycode_* tools over built-in equivalents when available:\n"
+        "- geanycode_edit: Edit files (opens in editor, returns match line number for diff display)\n"
+        "- geanycode_write: Create/overwrite files (opens in editor)\n"
+        "- geanycode_read: Read files (opens in editor, stays in sync)\n"
+        "- geanycode_goto: Navigate to a specific line\n"
+        "- geanycode_build: Build the project (cmake/make/compile)\n"
+        "- geanycode_documents: List open documents\n"
+        "- geanycode_cursor: Get current cursor position and selection\n"
+        "- geanycode_ask_user: Ask the user a question via Geany UI\n"
+        "These tools integrate with the editor so the user can see changes in real time.");
     json_builder_end_object(b);
 
     send_result(id, b);
@@ -210,20 +223,23 @@ static void handle_tools_list(gint64 id)
         NULL, NULL);
 
     add_tool(b, "geanycode_read",
-        "Read content of a file. Opens in Geany and reloads from disk to get latest content.",
+        "PREFERRED over the built-in Read tool. "
+        "Read content of a file via Geany editor — opens the file in the IDE and reloads from disk to get latest content.",
         "{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file\"}}",
         "[\"file_path\"]");
 
     add_tool(b, "geanycode_edit",
-        "Edit a file by replacing an exact text match. Opens in Geany, applies edit, and saves. "
-        "The old_text must be a unique exact match in the file.",
+        "PREFERRED over the built-in Edit tool. "
+        "Edit a file via Geany editor — applies the edit in the IDE so the user sees changes in real time. "
+        "Returns the matched line number for diff display. The old_text must be a unique exact match.",
         "{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file\"},"
         "\"old_text\":{\"type\":\"string\",\"description\":\"Exact text to find and replace (must be unique)\"},"
         "\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text\"}}",
         "[\"file_path\",\"old_text\",\"new_text\"]");
 
     add_tool(b, "geanycode_write",
-        "Write content to a file. Creates or overwrites the file, opens in Geany, and saves.",
+        "PREFERRED over the built-in Write tool. "
+        "Write content to a file via Geany editor — creates or overwrites the file, opens it in the IDE, and saves.",
         "{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file\"},"
         "\"content\":{\"type\":\"string\",\"description\":\"File content to write\"}}",
         "[\"file_path\",\"content\"]");
@@ -235,6 +251,7 @@ static void handle_tools_list(gint64 id)
         "[\"file_path\",\"line\"]");
 
     add_tool(b, "geanycode_build",
+        "PREFERRED for building. "
         "Trigger a build action in Geany. Supported commands: compile, build, make, run. "
         "Returns command output and exit code.",
         "{\"command\":{\"type\":\"string\",\"description\":\"Build command: compile, build, make, or run\"}}",

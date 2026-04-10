@@ -46,6 +46,32 @@ typedef struct {
     gchar       *last_text;     /* for diff-based skip */
 } ThinkingEntry;
 
+/* Lightweight log entry for markdown export */
+typedef enum {
+    LOG_MESSAGE, LOG_TOOL_CALL, LOG_TOOL_RESULT, LOG_THINKING
+} LogEntryType;
+
+typedef struct {
+    LogEntryType type;
+    gchar       *role;       /* "user", "assistant", "system" */
+    gchar       *content;    /* message text or thinking text */
+    gchar       *tool_name;  /* for TOOL_CALL / TOOL_RESULT */
+    gchar       *tool_input; /* for TOOL_CALL (first line / summary) */
+    gchar       *tool_result;/* for TOOL_RESULT */
+} LogEntry;
+
+static void log_entry_free(gpointer p)
+{
+    LogEntry *e = p;
+    if (!e) return;
+    g_free(e->role);
+    g_free(e->content);
+    g_free(e->tool_name);
+    g_free(e->tool_input);
+    g_free(e->tool_result);
+    g_free(e);
+}
+
 typedef struct {
     GtkWidget   *scroll;
     GtkWidget   *outer_box;
@@ -55,6 +81,7 @@ typedef struct {
     GHashTable  *msg_widgets;    /* id → MessageEntry* */
     GHashTable  *tool_widgets;   /* tool_id → ToolEntry* */
     GHashTable  *thinking_widgets; /* "msg_id:fragment" → ThinkingEntry* */
+    GList       *content_log;    /* ordered GList of LogEntry* for export */
     ChatWebViewPermissionCb permission_cb;
     gpointer    permission_data;
     ChatWebViewJumpToEditCb jump_cb;
@@ -879,8 +906,42 @@ static GtkWidget *create_source_view_with_offset(const gchar *code,
                                                    const gchar *lang_id,
                                                    gint start_line)
 {
-    (void)start_line;
-    return create_source_view(code, lang_id, FALSE);
+    GtkWidget *sv = create_source_view(code, lang_id, FALSE);
+    ScintillaObject *sci = g_object_get_data(G_OBJECT(sv), "scintilla");
+    if (!sci) return sv;
+
+    gint line_count = scintilla_send_message(sci, SCI_GETLINECOUNT, 0, 0);
+    gint max_num = start_line + line_count;
+
+    /* Calculate width for the largest line number */
+    gint digits = 1;
+    gint n = max_num;
+    while (n >= 10) { digits++; n /= 10; }
+    gint char_width = scintilla_send_message(sci, SCI_TEXTWIDTH,
+        STYLE_LINENUMBER, (sptr_t)"9");
+    gint margin_width = char_width * (digits + 1) + 4;
+
+    /* Use right-aligned text margin for custom line numbers */
+    scintilla_send_message(sci, SCI_SETMARGINTYPEN, 0, SC_MARGIN_RTEXT);
+    scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 0, margin_width);
+
+    /* Apply theme line-number colors to margin text style */
+    gint ln_fg = scintilla_send_message(sci, SCI_STYLEGETFORE, STYLE_LINENUMBER, 0);
+    gint ln_bg = scintilla_send_message(sci, SCI_STYLEGETBACK, STYLE_LINENUMBER, 0);
+    scintilla_send_message(sci, SCI_STYLESETFORE, STYLE_LINENUMBER, ln_fg);
+    scintilla_send_message(sci, SCI_STYLESETBACK, STYLE_LINENUMBER, ln_bg);
+
+    /* Set per-line margin text with the offset line numbers */
+    scintilla_send_message(sci, SCI_SETREADONLY, 0, 0);
+    for (gint i = 0; i < line_count; i++) {
+        gchar buf[16];
+        g_snprintf(buf, sizeof(buf), "%d ", start_line + i);
+        scintilla_send_message(sci, SCI_MARGINSETTEXT, i, (sptr_t)buf);
+        scintilla_send_message(sci, SCI_MARGINSETSTYLE, i, STYLE_LINENUMBER);
+    }
+    scintilla_send_message(sci, SCI_SETREADONLY, 1, 0);
+
+    return sv;
 }
 
 /* Create a source view using filename-based language detection.
@@ -958,9 +1019,16 @@ static GArray *compute_diff_lines(gchar **old_lines, guint n_old,
 
 /* Create a unified diff view with LCS-based line matching.
  * Unchanged lines get no marker, removed = red bg, added = green bg. */
+/* Custom style IDs for diff margin line numbers */
+#define STYLE_DIFF_MARGIN_UNCHANGED  200
+#define STYLE_DIFF_MARGIN_REMOVED    201
+#define STYLE_DIFF_MARGIN_ADDED      202
+
+/* start_line: 1-based file line where the edit occurs, or 0 if unknown */
 static GtkWidget *create_diff_source_view(const gchar *old_s,
                                            const gchar *new_s,
-                                           const gchar *file_path)
+                                           const gchar *file_path,
+                                           gint start_line)
 {
     gchar **old_lines = old_s ? g_strsplit(old_s, "\n", -1) : NULL;
     gchar **new_lines = new_s ? g_strsplit(new_s, "\n", -1) : NULL;
@@ -972,18 +1040,34 @@ static GtkWidget *create_diff_source_view(const gchar *old_s,
         old_lines ? old_lines : (gchar *[]){NULL}, n_old,
         new_lines ? new_lines : (gchar *[]){NULL}, n_new);
 
-    /* Build output text and per-line marker assignments */
+    /* Build output text, per-line marker assignments, and line numbers.
+     * Removed/unchanged lines track position in the old text;
+     * added/unchanged lines track position in the new text. */
     GString *buf = g_string_new("");
     GArray *markers = g_array_new(FALSE, FALSE, sizeof(gint));
+    GArray *line_nums = g_array_new(FALSE, FALSE, sizeof(gint));
+    gint old_line = start_line > 0 ? start_line : 0;
+    gint new_line = start_line > 0 ? start_line : 0;
 
     for (guint i = 0; i < diff->len; i++) {
         DiffLine *dl = &g_array_index(diff, DiffLine, i);
         if (buf->len > 0) g_string_append_c(buf, '\n');
         g_string_append(buf, dl->text);
-        gint m = (dl->kind == DIFF_REMOVED) ? 0
-               : (dl->kind == DIFF_ADDED)   ? 1
-               : -1;
+        gint m, ln;
+        if (dl->kind == DIFF_REMOVED) {
+            m = 0;
+            ln = old_line++;
+        } else if (dl->kind == DIFF_ADDED) {
+            m = 1;
+            ln = new_line++;
+        } else {
+            m = -1;
+            ln = new_line;  /* show new-file line for unchanged */
+            old_line++;
+            new_line++;
+        }
         g_array_append_val(markers, m);
+        g_array_append_val(line_nums, ln);
     }
 
     /* Create language-highlighted widget */
@@ -1006,6 +1090,7 @@ static GtkWidget *create_diff_source_view(const gchar *old_s,
         }
     }
 
+    /* Line background markers */
     scintilla_send_message(sci, SCI_MARKERDEFINE, 0, SC_MARK_BACKGROUND);
     scintilla_send_message(sci, SCI_MARKERSETBACK, 0, color_removed);
     scintilla_send_message(sci, SCI_MARKERSETALPHA, 0, 80);
@@ -1014,17 +1099,89 @@ static GtkWidget *create_diff_source_view(const gchar *old_s,
     scintilla_send_message(sci, SCI_MARKERSETBACK, 1, color_added);
     scintilla_send_message(sci, SCI_MARKERSETALPHA, 1, 80);
 
-    /* Apply markers per line */
+    /* Color-coded margin: line numbers when start_line is known,
+     * narrow color strip otherwise */
+    scintilla_send_message(sci, SCI_SETMARGINTYPEN, 0, SC_MARGIN_RTEXT);
+
+    gint ln_fg = scintilla_send_message(sci, SCI_STYLEGETFORE,
+        STYLE_LINENUMBER, 0);
+    gint ln_bg = scintilla_send_message(sci, SCI_STYLEGETBACK,
+        STYLE_LINENUMBER, 0);
+
+    if (start_line > 0) {
+        /* Calculate margin width from largest possible line number */
+        gint max_num = start_line + (gint)markers->len;
+        gint digits = 1;
+        { gint n = max_num; while (n >= 10) { digits++; n /= 10; } }
+        gint char_width = scintilla_send_message(sci, SCI_TEXTWIDTH,
+            STYLE_LINENUMBER, (sptr_t)"9");
+        scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 0,
+            char_width * (digits + 1) + 4);
+    } else {
+        /* No line info — narrow color strip only */
+        scintilla_send_message(sci, SCI_SETMARGINWIDTHN, 0, 4);
+    }
+
+    /* Configure 3 margin styles with colored backgrounds */
+    const gchar *font_family = NULL;
+    gint font_size = 0;
+    get_editor_font(&font_family, &font_size);
+    gint chat_font_size = font_size > 2 ? font_size - 2 : font_size;
+
+    /* Blend diff colors with the line-number background at ~30% opacity
+     * to match the tint used on the code lines (SCI_MARKERSETALPHA 80) */
+#define BLEND(base, overlay) \
+    ( ((((base)&0xFF)*175 + ((overlay)&0xFF)*80) / 255) | \
+      (((((base)>>8)&0xFF)*175 + (((overlay)>>8)&0xFF)*80) / 255) << 8 | \
+      (((((base)>>16)&0xFF)*175 + (((overlay)>>16)&0xFF)*80) / 255) << 16 )
+    gint blended_removed = BLEND(ln_bg, color_removed);
+    gint blended_added   = BLEND(ln_bg, color_added);
+#undef BLEND
+
+    gint margin_styles[] = { STYLE_DIFF_MARGIN_UNCHANGED,
+                             STYLE_DIFF_MARGIN_REMOVED,
+                             STYLE_DIFF_MARGIN_ADDED };
+    gint margin_bgs[]    = { ln_bg, blended_removed, blended_added };
+
+    for (gint s = 0; s < 3; s++) {
+        scintilla_send_message(sci, SCI_STYLESETFORE, margin_styles[s], ln_fg);
+        scintilla_send_message(sci, SCI_STYLESETBACK, margin_styles[s],
+                               margin_bgs[s]);
+        scintilla_send_message(sci, SCI_STYLESETFONT, margin_styles[s],
+                               (sptr_t)font_family);
+        scintilla_send_message(sci, SCI_STYLESETSIZE, margin_styles[s],
+                               chat_font_size);
+    }
+
+    /* Apply markers, margin text, and margin styles per line */
     for (guint i = 0; i < markers->len; i++) {
         gint m = g_array_index(markers, gint, i);
+
+        /* Line background marker */
         if (m >= 0)
             scintilla_send_message(sci, SCI_MARKERADD, i, m);
+
+        /* Margin: line number or just a colored space */
+        gchar nbuf[16];
+        if (start_line > 0) {
+            gint ln = g_array_index(line_nums, gint, i);
+            g_snprintf(nbuf, sizeof(nbuf), "%d ", ln);
+        } else {
+            g_snprintf(nbuf, sizeof(nbuf), " ");
+        }
+        scintilla_send_message(sci, SCI_MARGINSETTEXT, i, (sptr_t)nbuf);
+
+        gint mstyle = (m == 0) ? STYLE_DIFF_MARGIN_REMOVED
+                    : (m == 1) ? STYLE_DIFF_MARGIN_ADDED
+                    : STYLE_DIFF_MARGIN_UNCHANGED;
+        scintilla_send_message(sci, SCI_MARGINSETSTYLE, i, mstyle);
     }
 
     scintilla_send_message(sci, SCI_SETREADONLY, 1, 0);
 
     g_array_free(diff, TRUE);
     g_array_free(markers, TRUE);
+    g_array_free(line_nums, TRUE);
     g_strfreev(old_lines);
     g_strfreev(new_lines);
     g_string_free(buf, TRUE);
@@ -1590,6 +1747,14 @@ void chat_webview_add_message(GtkWidget *webview,
     gtk_widget_show_all(row);
 
     g_hash_table_insert(priv->msg_widgets, g_strdup(id), me);
+
+    /* Log for export */
+    LogEntry *le = g_new0(LogEntry, 1);
+    le->type = LOG_MESSAGE;
+    le->role = g_strdup(role);
+    le->content = g_strdup(content ? content : "");
+    priv->content_log = g_list_append(priv->content_log, le);
+
     { gchar *_desc = g_strdup_printf("add_message(role=%s)", role);
       WIDTH_DIAG_AFTER_IDLE(priv, _desc);
       g_free(_desc); }
@@ -1616,6 +1781,15 @@ void chat_webview_update_message(GtkWidget *webview,
     render_content(me->content_box, content, me->role, is_streaming);
     g_free(me->last_content);
     me->last_content = g_strdup(content ? content : "");
+
+    /* Update the last log entry for this message (streaming updates) */
+    if (priv->content_log) {
+        LogEntry *last = g_list_last(priv->content_log)->data;
+        if (last->type == LOG_MESSAGE) {
+            g_free(last->content);
+            last->content = g_strdup(content ? content : "");
+        }
+    }
 
     WIDTH_DIAG_AFTER_IDLE(priv, "update_message");
     scroll_to_bottom(priv);
@@ -1685,6 +1859,48 @@ void chat_webview_add_tool_call(GtkWidget *webview,
             is_error ? "tool-status-error" : "tool-status-success");
         gtk_label_set_text(GTK_LABEL(existing->status_label), "\u25CF");
 
+        /* For edit tools, check if the result contains a line number
+         * and rebuild the diff view with proper line numbering */
+        if (result && is_edit_tool(existing->tool_name)) {
+            const gchar *diff_old = g_object_get_data(
+                G_OBJECT(existing->body_box), "diff-old");
+            if (diff_old && strstr(result, "\"line\"")) {
+                JsonParser *rp = json_parser_new();
+                if (json_parser_load_from_data(rp, result, -1, NULL)) {
+                    JsonNode *rn = json_parser_get_root(rp);
+                    if (rn && JSON_NODE_HOLDS_OBJECT(rn)) {
+                        JsonObject *ro = json_node_get_object(rn);
+                        if (json_object_has_member(ro, "line")) {
+                            gint line = (gint)json_object_get_int_member(ro, "line");
+                            const gchar *diff_new = g_object_get_data(
+                                G_OBJECT(existing->body_box), "diff-new");
+                            const gchar *diff_file = g_object_get_data(
+                                G_OBJECT(existing->body_box), "diff-file");
+                            GtkWidget *old_sv = g_object_get_data(
+                                G_OBJECT(existing->body_box), "diff-widget");
+
+                            /* Replace the diff widget with a line-numbered one */
+                            GtkWidget *new_sv = create_diff_source_view(
+                                diff_old, diff_new, diff_file, line);
+                            if (old_sv) {
+                                gtk_container_remove(
+                                    GTK_CONTAINER(existing->body_box), old_sv);
+                            }
+                            /* Insert at the beginning (before jump button) */
+                            gtk_box_pack_start(GTK_BOX(existing->body_box),
+                                new_sv, FALSE, FALSE, 0);
+                            gtk_box_reorder_child(GTK_BOX(existing->body_box),
+                                new_sv, 0);
+                            gtk_widget_show_all(new_sv);
+                            g_object_set_data(G_OBJECT(existing->body_box),
+                                "diff-widget", new_sv);
+                        }
+                    }
+                }
+                g_object_unref(rp);
+            }
+        }
+
         /* Append result — render based on tool type */
         if (result && strlen(result) > 0) {
             GtkWidget *result_widget = NULL;
@@ -1723,6 +1939,15 @@ void chat_webview_add_tool_call(GtkWidget *webview,
             gtk_box_pack_start(GTK_BOX(existing->body_box), result_widget, FALSE, FALSE, 0);
             gtk_widget_show_all(result_widget);
         }
+        /* Log result for export */
+        if (result && strlen(result) > 0) {
+            LogEntry *le = g_new0(LogEntry, 1);
+            le->type = LOG_TOOL_RESULT;
+            le->tool_name = g_strdup(existing->tool_name);
+            le->tool_result = g_strdup(result);
+            priv->content_log = g_list_append(priv->content_log, le);
+        }
+
         { gchar *_desc = g_strdup_printf("tool_result(%s)", existing->tool_name);
           WIDTH_DIAG_AFTER_IDLE(priv, _desc);
           g_free(_desc); }
@@ -1835,8 +2060,16 @@ void chat_webview_add_tool_call(GtkWidget *webview,
         if (old_s && new_s) {
             /* Unified diff block: removed lines (red bg) then added (green bg),
              * all language-highlighted from the file extension */
-            GtkWidget *sv = create_diff_source_view(old_s, new_s, file_path);
+            GtkWidget *sv = create_diff_source_view(old_s, new_s, file_path, 0);
             gtk_box_pack_start(GTK_BOX(te->body_box), sv, FALSE, FALSE, 0);
+            /* Store diff params for rebuilding when result provides line no */
+            g_object_set_data_full(G_OBJECT(te->body_box), "diff-old",
+                g_strdup(old_s), g_free);
+            g_object_set_data_full(G_OBJECT(te->body_box), "diff-new",
+                g_strdup(new_s), g_free);
+            g_object_set_data_full(G_OBJECT(te->body_box), "diff-file",
+                g_strdup(file_path ? file_path : ""), g_free);
+            g_object_set_data(G_OBJECT(te->body_box), "diff-widget", sv);
 
             /* Jump to file link */
             if (file_path && priv->jump_cb) {
@@ -1904,6 +2137,13 @@ void chat_webview_add_tool_call(GtkWidget *webview,
 
     g_hash_table_insert(priv->tool_widgets, g_strdup(tool_id), te);
     g_object_unref(jp);
+
+    /* Log for export */
+    LogEntry *le = g_new0(LogEntry, 1);
+    le->type = LOG_TOOL_CALL;
+    le->tool_name = g_strdup(tool_name);
+    le->tool_input = g_strdup(file_path ? file_path : "");
+    priv->content_log = g_list_append(priv->content_log, le);
 
     { gchar *_desc = g_strdup_printf("add_tool(%s)", tool_name);
       WIDTH_DIAG_AFTER_IDLE(priv, _desc);
@@ -2428,17 +2668,79 @@ void chat_webview_clear(GtkWidget *webview)
     g_hash_table_remove_all(priv->msg_widgets);
     g_hash_table_remove_all(priv->tool_widgets);
     g_hash_table_remove_all(priv->thinking_widgets);
+    g_list_free_full(priv->content_log, log_entry_free);
+    priv->content_log = NULL;
 
     /* Show welcome again */
     if (priv->welcome)
         gtk_widget_show(priv->welcome);
 
-    /* Clear todos */
+    /* Clear todos and re-hide */
     children = gtk_container_get_children(GTK_CONTAINER(priv->todos_box));
     for (GList *c = children; c; c = c->next)
         gtk_widget_destroy(GTK_WIDGET(c->data));
     g_list_free(children);
+    gtk_widget_set_no_show_all(priv->todos_box, TRUE);
     gtk_widget_hide(priv->todos_box);
+}
+
+gchar *chat_webview_export_markdown(GtkWidget *webview)
+{
+    ChatViewPrivate *priv = get_priv(webview);
+    if (!priv) return g_strdup("");
+
+    GString *md = g_string_new("# Conversation Export\n\n");
+
+    for (GList *l = priv->content_log; l; l = l->next) {
+        LogEntry *e = l->data;
+
+        switch (e->type) {
+        case LOG_MESSAGE:
+            if (g_strcmp0(e->role, "user") == 0)
+                g_string_append(md, "## User\n\n");
+            else if (g_strcmp0(e->role, "assistant") == 0)
+                g_string_append(md, "## Assistant\n\n");
+            else
+                g_string_append_printf(md, "## %s\n\n",
+                    e->role ? e->role : "System");
+
+            if (e->content && e->content[0] != '\0') {
+                g_string_append(md, e->content);
+                g_string_append(md, "\n\n");
+            }
+            break;
+
+        case LOG_TOOL_CALL:
+            g_string_append_printf(md, "### Tool: %s",
+                e->tool_name ? e->tool_name : "unknown");
+            if (e->tool_input && e->tool_input[0] != '\0')
+                g_string_append_printf(md, " `%s`", e->tool_input);
+            g_string_append(md, "\n\n");
+            break;
+
+        case LOG_TOOL_RESULT:
+            if (e->tool_result && e->tool_result[0] != '\0') {
+                g_string_append(md, "<details>\n<summary>Result</summary>\n\n");
+                g_string_append(md, "```\n");
+                g_string_append(md, e->tool_result);
+                if (e->tool_result[strlen(e->tool_result) - 1] != '\n')
+                    g_string_append_c(md, '\n');
+                g_string_append(md, "```\n\n");
+                g_string_append(md, "</details>\n\n");
+            }
+            break;
+
+        case LOG_THINKING:
+            if (e->content && e->content[0] != '\0') {
+                g_string_append(md, "<details>\n<summary>Thinking</summary>\n\n");
+                g_string_append(md, e->content);
+                g_string_append(md, "\n\n</details>\n\n");
+            }
+            break;
+        }
+    }
+
+    return g_string_free(md, FALSE);
 }
 
 void chat_webview_apply_theme(GtkWidget *webview)

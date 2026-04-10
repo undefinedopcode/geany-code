@@ -14,13 +14,14 @@
 
 /* ── Data model ─────────────────────────────────────────────────── */
 
-typedef enum { HOOK_TYPE_COMMAND, HOOK_TYPE_PROMPT } HookType;
+typedef enum { HOOK_TYPE_COMMAND, HOOK_TYPE_PROMPT, HOOK_TYPE_AGENT } HookType;
 
 typedef struct {
     gchar    *matcher;
     HookType  type;
-    gchar    *command;   /* shell command (type == COMMAND) */
-    gchar    *prompt;    /* prompt text  (type == PROMPT)  */
+    gchar    *command;   /* shell command  (type == COMMAND) */
+    gchar    *prompt;    /* prompt text    (type == PROMPT or AGENT) */
+    gchar    *if_cond;   /* optional permission-rule filter, e.g. "Bash(git *)" */
 } HookEntry;
 
 static HookEntry *hook_entry_new_command(const gchar *matcher,
@@ -43,6 +44,16 @@ static HookEntry *hook_entry_new_prompt(const gchar *matcher,
     return e;
 }
 
+static HookEntry *hook_entry_new_agent(const gchar *matcher,
+                                       const gchar *prompt)
+{
+    HookEntry *e = g_new0(HookEntry, 1);
+    e->matcher = g_strdup(matcher);
+    e->type = HOOK_TYPE_AGENT;
+    e->prompt = g_strdup(prompt);
+    return e;
+}
+
 static void hook_entry_free(gpointer p)
 {
     HookEntry *e = p;
@@ -50,6 +61,7 @@ static void hook_entry_free(gpointer p)
     g_free(e->matcher);
     g_free(e->command);
     g_free(e->prompt);
+    g_free(e->if_cond);
     g_free(e);
 }
 
@@ -121,6 +133,28 @@ static const HookPreset pre_tool_presets[] = {
         "$ARGUMENTS\n\n"
         "Block the edit if it modifies credentials, secrets, CI/CD config,\n"
         "or deployment files. Allow edits to source code and documentation."
+    },
+    {
+        "Verify command safety (agent)", "Bash", HOOK_TYPE_AGENT,
+        NULL,
+        "A Bash command is about to execute:\n"
+        "$ARGUMENTS\n\n"
+        "Verify it is safe by:\n"
+        "1. Check for destructive operations (rm -rf, DROP TABLE, etc.)\n"
+        "2. If the command modifies files, read them first to confirm context\n"
+        "3. Verify no secrets or credentials are being leaked\n\n"
+        "Allow routine operations like builds, tests, git status, and searches."
+    },
+    {
+        "Verify edit in context (agent)", "Edit|Write", HOOK_TYPE_AGENT,
+        NULL,
+        "A file edit is about to be applied:\n"
+        "$ARGUMENTS\n\n"
+        "Verify the edit is appropriate:\n"
+        "1. Read the target file to understand the surrounding code\n"
+        "2. Check that the edit doesn't break imports or function signatures\n"
+        "3. Verify no security-sensitive values are being hardcoded\n\n"
+        "Allow edits that look correct in context."
     },
     { NULL, NULL, 0, NULL, NULL }
 };
@@ -273,17 +307,25 @@ static GList *load_hooks(const gchar *path, const gchar *event_name)
                 const gchar *type_str = json_object_has_member(h, "type")
                     ? json_object_get_string_member(h, "type") : "command";
 
+                const gchar *if_cond = json_object_has_member(h, "if")
+                    ? json_object_get_string_member(h, "if") : NULL;
+                HookEntry *he;
+
                 if (g_strcmp0(type_str, "prompt") == 0) {
                     const gchar *prompt = json_object_has_member(h, "prompt")
                         ? json_object_get_string_member(h, "prompt") : "";
-                    list = g_list_append(list,
-                        hook_entry_new_prompt(matcher, prompt));
+                    he = hook_entry_new_prompt(matcher, prompt);
+                } else if (g_strcmp0(type_str, "agent") == 0) {
+                    const gchar *prompt = json_object_has_member(h, "prompt")
+                        ? json_object_get_string_member(h, "prompt") : "";
+                    he = hook_entry_new_agent(matcher, prompt);
                 } else {
                     const gchar *command = json_object_has_member(h, "command")
                         ? json_object_get_string_member(h, "command") : "";
-                    list = g_list_append(list,
-                        hook_entry_new_command(matcher, command));
+                    he = hook_entry_new_command(matcher, command);
                 }
+                he->if_cond = g_strdup(if_cond);
+                list = g_list_append(list, he);
             }
         }
     }
@@ -340,11 +382,18 @@ static gboolean save_hooks(const gchar *path, const gchar *event_name,
                 json_object_set_string_member(inner_hook, "type", "prompt");
                 json_object_set_string_member(inner_hook, "prompt",
                                               e->prompt ? e->prompt : "");
+            } else if (e->type == HOOK_TYPE_AGENT) {
+                json_object_set_string_member(inner_hook, "type", "agent");
+                json_object_set_string_member(inner_hook, "prompt",
+                                              e->prompt ? e->prompt : "");
             } else {
                 json_object_set_string_member(inner_hook, "type", "command");
                 json_object_set_string_member(inner_hook, "command",
                                               e->command ? e->command : "");
             }
+
+            if (e->if_cond && e->if_cond[0] != '\0')
+                json_object_set_string_member(inner_hook, "if", e->if_cond);
 
             JsonArray *inner_arr = json_array_new();
             json_array_add_object_element(inner_arr, inner_hook);
@@ -384,7 +433,9 @@ static void on_type_combo_changed(GtkComboBox *combo, gpointer data)
 {
     GtkStack *stack = GTK_STACK(data);
     gint active = gtk_combo_box_get_active(combo);
-    gtk_stack_set_visible_child_name(stack, active == 1 ? "prompt" : "command");
+    const gchar *pages[] = { "command", "prompt", "agent" };
+    if (active >= 0 && active <= 2)
+        gtk_stack_set_visible_child_name(stack, pages[active]);
 }
 
 static gboolean edit_hook_dialog(GtkWindow *parent, HookEntry *entry,
@@ -415,6 +466,18 @@ static gboolean edit_hook_dialog(GtkWindow *parent, HookEntry *entry,
         gtk_entry_set_text(GTK_ENTRY(matcher_entry), entry->matcher);
     gtk_box_pack_start(GTK_BOX(content), matcher_entry, FALSE, FALSE, 0);
 
+    /* Condition (optional argument-level filter) */
+    GtkWidget *iflabel = gtk_label_new("Condition (optional, permission-rule syntax):");
+    gtk_label_set_xalign(GTK_LABEL(iflabel), 0);
+    gtk_box_pack_start(GTK_BOX(content), iflabel, FALSE, FALSE, 0);
+
+    GtkWidget *if_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(if_entry),
+                                   "e.g. Bash(git *), Edit(*.ts), Write(src/*)");
+    if (entry->if_cond)
+        gtk_entry_set_text(GTK_ENTRY(if_entry), entry->if_cond);
+    gtk_box_pack_start(GTK_BOX(content), if_entry, FALSE, FALSE, 0);
+
     /* Hook type selector */
     GtkWidget *type_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     GtkWidget *tlabel = gtk_label_new("Type:");
@@ -424,7 +487,9 @@ static gboolean edit_hook_dialog(GtkWindow *parent, HookEntry *entry,
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(type_combo),
                                    "Command (shell script)");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(type_combo),
-                                   "Prompt (LLM evaluation)");
+                                   "Prompt (single-turn LLM)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(type_combo),
+                                   "Agent (multi-turn with tools)");
     /* Don't set active yet — wait until the stack is built */
     gtk_box_pack_start(GTK_BOX(type_box), type_combo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(content), type_box, FALSE, FALSE, 0);
@@ -497,6 +562,39 @@ static gboolean edit_hook_dialog(GtkWindow *parent, HookEntry *entry,
 
     gtk_stack_add_named(GTK_STACK(stack), prompt_box, "prompt");
 
+    /* ── Agent page ── */
+    GtkWidget *agent_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+
+    GtkWidget *alabel = gtk_label_new("Agent prompt (multi-turn, has tool access):");
+    gtk_label_set_xalign(GTK_LABEL(alabel), 0);
+    gtk_box_pack_start(GTK_BOX(agent_box), alabel, FALSE, FALSE, 0);
+
+    GtkWidget *agent_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(agent_scroll),
+        GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_shadow_type(GTK_SCROLLED_WINDOW(agent_scroll),
+        GTK_SHADOW_IN);
+
+    GtkWidget *agent_view = gtk_text_view_new();
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(agent_view), GTK_WRAP_WORD_CHAR);
+    if (entry->type == HOOK_TYPE_AGENT && entry->prompt) {
+        GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(agent_view));
+        gtk_text_buffer_set_text(buf, entry->prompt, -1);
+    }
+    gtk_container_add(GTK_CONTAINER(agent_scroll), agent_view);
+    gtk_box_pack_start(GTK_BOX(agent_box), agent_scroll, TRUE, TRUE, 0);
+
+    GtkWidget *agent_help = gtk_label_new(
+        "The agent can use Read, Grep, Glob, Edit, Write, and Bash tools\n"
+        "to inspect the codebase before making a decision.\n"
+        "Use $ARGUMENTS for the hook's JSON input. Default timeout: 60s.");
+    gtk_label_set_xalign(GTK_LABEL(agent_help), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(agent_help), TRUE);
+    gtk_widget_set_opacity(agent_help, 0.6);
+    gtk_box_pack_start(GTK_BOX(agent_box), agent_help, FALSE, FALSE, 0);
+
+    gtk_stack_add_named(GTK_STACK(stack), agent_box, "agent");
+
     gtk_box_pack_start(GTK_BOX(content), stack, TRUE, TRUE, 0);
 
     /* Wire combo to stack */
@@ -508,15 +606,15 @@ static gboolean edit_hook_dialog(GtkWindow *parent, HookEntry *entry,
      * so we must set the combo (and thus the stack page) AFTER. */
     gtk_widget_show_all(dlg);
 
-    gtk_combo_box_set_active(GTK_COMBO_BOX(type_combo),
-                             entry->type == HOOK_TYPE_PROMPT ? 1 : 0);
+    gint init_type = (entry->type == HOOK_TYPE_AGENT) ? 2
+                   : (entry->type == HOOK_TYPE_PROMPT) ? 1 : 0;
+    gtk_combo_box_set_active(GTK_COMBO_BOX(type_combo), init_type);
 
     gboolean result = FALSE;
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
         const gchar *m = gtk_entry_get_text(GTK_ENTRY(matcher_entry));
         const gchar *active_page = gtk_stack_get_visible_child_name(
             GTK_STACK(stack));
-        gboolean is_prompt = g_strcmp0(active_page, "prompt") == 0;
 
         /* Validate matcher is valid regex */
         GError *err = NULL;
@@ -532,27 +630,40 @@ static gboolean edit_hook_dialog(GtkWindow *parent, HookEntry *entry,
         } else {
             g_regex_unref(re);
 
-            GtkTextView *active_view = is_prompt
-                ? GTK_TEXT_VIEW(prompt_view)
-                : GTK_TEXT_VIEW(cmd_view);
+            /* Get text from the active page's text view */
+            GtkTextView *active_view;
+            if (g_strcmp0(active_page, "agent") == 0)
+                active_view = GTK_TEXT_VIEW(agent_view);
+            else if (g_strcmp0(active_page, "prompt") == 0)
+                active_view = GTK_TEXT_VIEW(prompt_view);
+            else
+                active_view = GTK_TEXT_VIEW(cmd_view);
+
             GtkTextBuffer *buf = gtk_text_view_get_buffer(active_view);
             GtkTextIter start, end;
             gtk_text_buffer_get_bounds(buf, &start, &end);
             gchar *text = gtk_text_buffer_get_text(buf, &start, &end, FALSE);
 
             if (m[0] != '\0' && text[0] != '\0') {
+                const gchar *if_val = gtk_entry_get_text(GTK_ENTRY(if_entry));
                 g_free(entry->matcher);
                 g_free(entry->command);
                 g_free(entry->prompt);
+                g_free(entry->if_cond);
                 entry->matcher = g_strdup(m);
-                if (is_prompt) {
+                entry->if_cond = (if_val && if_val[0] != '\0')
+                    ? g_strdup(if_val) : NULL;
+                entry->command = NULL;
+                entry->prompt = NULL;
+                if (g_strcmp0(active_page, "agent") == 0) {
+                    entry->type = HOOK_TYPE_AGENT;
+                    entry->prompt = text;
+                } else if (g_strcmp0(active_page, "prompt") == 0) {
                     entry->type = HOOK_TYPE_PROMPT;
                     entry->prompt = text;
-                    entry->command = NULL;
                 } else {
                     entry->type = HOOK_TYPE_COMMAND;
                     entry->command = text;
-                    entry->prompt = NULL;
                 }
                 result = TRUE;
             } else {
@@ -652,11 +763,17 @@ static void rebuild_list(HooksDialogCtx *ctx)
         gtk_widget_set_margin_top(row_box, 4);
         gtk_widget_set_margin_bottom(row_box, 4);
 
-        /* Matcher (bold) + type tag */
-        const gchar *type_tag = (e->type == HOOK_TYPE_PROMPT)
-            ? "prompt" : "command";
-        gchar *markup = g_markup_printf_escaped(
-            "<b>%s</b>  <small>(%s)</small>", e->matcher, type_tag);
+        /* Matcher (bold) + type tag + optional if condition */
+        const gchar *type_tag = (e->type == HOOK_TYPE_AGENT) ? "agent"
+            : (e->type == HOOK_TYPE_PROMPT) ? "prompt" : "command";
+        gchar *markup;
+        if (e->if_cond && e->if_cond[0] != '\0')
+            markup = g_markup_printf_escaped(
+                "<b>%s</b>  <small>(%s, if %s)</small>",
+                e->matcher, type_tag, e->if_cond);
+        else
+            markup = g_markup_printf_escaped(
+                "<b>%s</b>  <small>(%s)</small>", e->matcher, type_tag);
         GtkWidget *match_label = gtk_label_new(NULL);
         gtk_label_set_markup(GTK_LABEL(match_label), markup);
         gtk_label_set_xalign(GTK_LABEL(match_label), 0);
@@ -664,8 +781,8 @@ static void rebuild_list(HooksDialogCtx *ctx)
         gtk_box_pack_start(GTK_BOX(row_box), match_label, FALSE, FALSE, 0);
 
         /* Content preview — show first line only */
-        const gchar *content_text = (e->type == HOOK_TYPE_PROMPT)
-            ? e->prompt : e->command;
+        const gchar *content_text = (e->type == HOOK_TYPE_COMMAND)
+            ? e->command : e->prompt;
         gchar *first_line = g_strdup(content_text ? content_text : "");
         gchar *nl = strchr(first_line, '\n');
         if (nl) *nl = '\0';
@@ -730,7 +847,9 @@ static void on_preset_activate(GtkMenuItem *item, gpointer data)
     const HookPreset *p = g_object_get_data(G_OBJECT(item), "preset");
     if (!p) return;
 
-    HookEntry *entry = (p->type == HOOK_TYPE_PROMPT)
+    HookEntry *entry = (p->type == HOOK_TYPE_AGENT)
+        ? hook_entry_new_agent(p->matcher, p->prompt)
+        : (p->type == HOOK_TYPE_PROMPT)
         ? hook_entry_new_prompt(p->matcher, p->prompt)
         : hook_entry_new_command(p->matcher, p->command);
     if (edit_hook_dialog(ctx->parent, entry, TRUE, cur_evtype(ctx))) {

@@ -69,6 +69,9 @@ void chat_webview_add_history_separator(GtkWidget *webview);
 /* Clear all messages */
 void chat_webview_clear(GtkWidget *webview);
 
+/* Export conversation as markdown string. Caller frees with g_free(). */
+gchar *chat_webview_export_markdown(GtkWidget *webview);
+
 /* Set theme colors from GTK */
 void chat_webview_apply_theme(GtkWidget *webview);
 

@@ -253,8 +253,14 @@ static void handle_method_call(GDBusConnection       *conn,
         /* Save the document */
         document_save_file(doc, FALSE);
 
+        /* Return structured response with the match line number */
+        gint match_line = sci_get_line_from_position(sci, start_pos) + 1;
+        gchar *response = g_strdup_printf(
+            "{\"status\":\"ok\",\"line\":%d,\"message\":\"Edit applied at line %d\"}",
+            match_line, match_line);
         g_dbus_method_invocation_return_value(
-            invocation, g_variant_new("(s)", "Edit applied and saved"));
+            invocation, g_variant_new("(s)", response));
+        g_free(response);
 
     } else if (g_strcmp0(method_name, "WriteDocument") == 0) {
         const gchar *file_path = NULL, *content = NULL;
