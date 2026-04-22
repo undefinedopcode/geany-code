@@ -88,6 +88,11 @@ typedef struct {
     gpointer    jump_data;
     GtkCssProvider *css;
     gdouble     last_scroll_max; /* for auto-scroll tracking */
+    /* Most-recent tool_id awaiting a permission decision. Used to
+     * attach inline Accept/Reject buttons to the tool block (diff for
+     * edits, command body for bash, etc.) instead of showing the
+     * standalone permission card. */
+    gchar       *last_tool_id;
 } ChatViewPrivate;
 
 static const gchar *PRIV_KEY = "geany-code-chatview-priv";
@@ -1602,6 +1607,23 @@ static const gchar *base_css =
     ".perm-btn { padding: 4px 12px; }\n"
     ".perm-card { padding: 10px; border: 2px solid @theme_selected_bg_color; "
     "  border-radius: 8px; background: alpha(@theme_selected_bg_color, 0.06); }\n"
+    ".inline-perm-row { padding: 4px 2px; }\n"
+    ".inline-perm-btn, .inline-perm-btn-accept, .inline-perm-btn-reject { "
+    "  padding: 2px 10px; font-size: small; border-radius: 4px; }\n"
+    ".inline-perm-btn-accept { color: #2ecc71; "
+    "  border: 1px solid alpha(#2ecc71, 0.5); }\n"
+    ".inline-perm-btn-accept:hover { "
+    "  background: alpha(#2ecc71, 0.15); }\n"
+    ".inline-perm-btn-reject { color: #e74c3c; "
+    "  border: 1px solid alpha(#e74c3c, 0.5); }\n"
+    ".inline-perm-btn-reject:hover { "
+    "  background: alpha(#e74c3c, 0.15); }\n"
+    ".inline-perm-status { font-size: small; "
+    "  color: @insensitive_fg_color; padding: 2px 4px; }\n"
+    ".msg-copy-btn { opacity: 0.0; padding: 0 4px; min-height: 20px; "
+    "  min-width: 20px; transition: opacity 150ms ease; }\n"
+    ".msg-row:hover .msg-copy-btn { opacity: 0.5; }\n"
+    ".msg-row .msg-copy-btn:hover { opacity: 1.0; }\n"
     ".uq-card { padding: 12px; border: 2px solid @theme_selected_bg_color; "
     "  border-radius: 8px; background: alpha(@theme_selected_bg_color, 0.06); }\n"
     ".history-sep { font-size: small; color: @insensitive_fg_color; "
@@ -1700,6 +1722,15 @@ GtkWidget *chat_webview_new(void)
 
 /* ── Message API ─────────────────────────────────────────────────── */
 
+static void on_copy_message_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    MessageEntry *me = data;
+    if (!me || !me->last_content) return;
+    GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(clip, me->last_content, -1);
+}
+
 void chat_webview_add_message(GtkWidget *webview,
                               const gchar *id, const gchar *role,
                               const gchar *content, const gchar *timestamp,
@@ -1736,11 +1767,38 @@ void chat_webview_add_message(GtkWidget *webview,
     render_content(content_box, content, role, is_streaming);
     me->last_content = g_strdup(content ? content : "");
 
+    /* For assistant messages, overlay a hover-reveal copy button in the
+     * top-right corner. Copies `last_content` (kept fresh during
+     * streaming via chat_webview_update_message). */
+    GtkWidget *row_child = content_box;
+    if (g_strcmp0(role, "assistant") == 0) {
+        GtkWidget *overlay = gtk_overlay_new();
+        gtk_container_add(GTK_CONTAINER(overlay), content_box);
+
+        GtkWidget *copy_btn = gtk_button_new_from_icon_name(
+            "edit-copy-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
+        gtk_button_set_relief(GTK_BUTTON(copy_btn), GTK_RELIEF_NONE);
+        gtk_widget_set_tooltip_text(copy_btn, "Copy response");
+        gtk_widget_set_halign(copy_btn, GTK_ALIGN_END);
+        gtk_widget_set_valign(copy_btn, GTK_ALIGN_START);
+        gtk_widget_set_margin_end(copy_btn, 4);
+        gtk_widget_set_margin_top(copy_btn, 4);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(copy_btn), "msg-copy-btn");
+        g_signal_connect(copy_btn, "clicked",
+            G_CALLBACK(on_copy_message_clicked), me);
+        gtk_overlay_add_overlay(GTK_OVERLAY(overlay), copy_btn);
+
+        row_child = overlay;
+    }
+
     /* Add to list */
     GtkWidget *row = gtk_list_box_row_new();
     gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
     gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
-    gtk_container_add(GTK_CONTAINER(row), content_box);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(row), "msg-row");
+    gtk_container_add(GTK_CONTAINER(row), row_child);
     me->row = row;
 
     gtk_list_box_insert(GTK_LIST_BOX(priv->list_box), row, -1);
@@ -2136,6 +2194,14 @@ void chat_webview_add_tool_call(GtkWidget *webview,
     gtk_widget_show_all(row);
 
     g_hash_table_insert(priv->tool_widgets, g_strdup(tool_id), te);
+
+    /* Remember this as the candidate for inline accept/reject if a
+     * permission prompt follows. The permission handler correlates by
+     * tool_name match, so this tracks every tool call — not just
+     * edit-family. */
+    g_free(priv->last_tool_id);
+    priv->last_tool_id = g_strdup(tool_id);
+
     g_object_unref(jp);
 
     /* Log for export */
@@ -2283,6 +2349,145 @@ static void on_perm_btn_clicked(GtkButton *btn, gpointer data)
     g_free(pd);
 }
 
+/* Inline accept/reject on a diff block. Handler replaces the button
+ * row with a muted status label in place, so the diff stays visible. */
+
+typedef struct {
+    ChatViewPrivate *priv;
+    gchar *request_id;
+    GtkWidget *button_row;     /* container holding the buttons */
+    const gchar *status_label; /* label shown after click */
+} InlinePermClickData;
+
+static void on_inline_perm_btn_clicked(GtkButton *btn, gpointer data)
+{
+    InlinePermClickData *pd = data;
+    const gchar *option_id = g_object_get_data(G_OBJECT(btn), "option-id");
+
+    if (pd->priv->permission_cb)
+        pd->priv->permission_cb(pd->request_id, option_id,
+                                 pd->priv->permission_data);
+
+    /* Strip the button row's children and replace with a status label. */
+    GtkContainer *box = GTK_CONTAINER(pd->button_row);
+    GList *kids = gtk_container_get_children(box);
+    for (GList *k = kids; k; k = k->next)
+        gtk_widget_destroy(GTK_WIDGET(k->data));
+    g_list_free(kids);
+
+    GtkWidget *status = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(status), pd->status_label);
+    gtk_label_set_xalign(GTK_LABEL(status), 0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(status), "inline-perm-status");
+    gtk_box_pack_start(GTK_BOX(pd->button_row), status, FALSE, FALSE, 0);
+    gtk_widget_show_all(pd->button_row);
+}
+
+static void inline_perm_click_data_free(gpointer p)
+{
+    InlinePermClickData *pd = p;
+    if (!pd) return;
+    g_free(pd->request_id);
+    g_free(pd);
+}
+
+/* Pick a muted status string for a given option id. */
+static const gchar *inline_perm_status_markup(const gchar *option_id)
+{
+    if (g_strcmp0(option_id, "deny") == 0)
+        return "<span alpha=\"65%\"><b>✗</b> Rejected</span>";
+    if (option_id && g_str_has_prefix(option_id, "suggestion_"))
+        return "<span alpha=\"65%\"><b>✓</b> Accepted for session</span>";
+    return "<span alpha=\"65%\"><b>✓</b> Accepted</span>";
+}
+
+/* Try to attach Accept/Reject/… buttons directly to the most-recent
+ * edit tool call's diff block. Returns TRUE if buttons were placed (so
+ * the caller should skip rendering the standalone permission card). */
+static gboolean try_attach_inline_permission(ChatViewPrivate *priv,
+                                              const gchar *request_id,
+                                              const gchar *tool_name,
+                                              JsonArray *options)
+{
+    if (!priv->last_tool_id)
+        return FALSE;
+
+    ToolEntry *te = g_hash_table_lookup(priv->tool_widgets,
+                                         priv->last_tool_id);
+    if (!te || !te->body_box)
+        return FALSE;
+
+    /* Correlate strictly by tool_name — a permission for Bash should
+     * never attach to a preceding Edit block even if it was the most
+     * recent tool call. */
+    if (g_strcmp0(te->tool_name, tool_name) != 0)
+        return FALSE;
+
+    GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(btn_row), "inline-perm-row");
+    gtk_widget_set_margin_top(btn_row, 4);
+
+    guint n = json_array_get_length(options);
+    for (guint i = 0; i < n; i++) {
+        JsonObject *opt = json_array_get_object_element(options, i);
+        if (!opt) continue;
+        const gchar *opt_id = json_object_has_member(opt, "id")
+            ? json_object_get_string_member(opt, "id") : NULL;
+        const gchar *opt_label = json_object_has_member(opt, "label")
+            ? json_object_get_string_member(opt, "label") : NULL;
+        if (!opt_id || !opt_label) continue;
+
+        /* Relabel the common ids for a cleaner inline look. */
+        const gchar *display = opt_label;
+        const gchar *style_class = "inline-perm-btn";
+        if (g_strcmp0(opt_id, "allow") == 0) {
+            display = "✓ Accept";
+            style_class = "inline-perm-btn-accept";
+        } else if (g_strcmp0(opt_id, "deny") == 0) {
+            display = "✗ Reject";
+            style_class = "inline-perm-btn-reject";
+        }
+
+        GtkWidget *btn = gtk_button_new_with_label(display);
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(btn), style_class);
+        g_object_set_data_full(G_OBJECT(btn), "option-id",
+                                g_strdup(opt_id), g_free);
+
+        InlinePermClickData *pd = g_new0(InlinePermClickData, 1);
+        pd->priv = priv;
+        pd->request_id = g_strdup(request_id);
+        pd->button_row = btn_row;
+        pd->status_label = inline_perm_status_markup(opt_id);
+
+        g_signal_connect_data(btn, "clicked",
+            G_CALLBACK(on_inline_perm_btn_clicked), pd,
+            (GClosureNotify)inline_perm_click_data_free,
+            (GConnectFlags)0);
+
+        gtk_box_pack_start(GTK_BOX(btn_row), btn, FALSE, FALSE, 0);
+    }
+
+    gtk_box_pack_start(GTK_BOX(te->body_box), btn_row, FALSE, FALSE, 0);
+    gtk_widget_show_all(btn_row);
+
+    /* Make sure the diff is expanded so the buttons are visible. */
+    if (te->revealer)
+        gtk_revealer_set_reveal_child(GTK_REVEALER(te->revealer), TRUE);
+    te->expanded = TRUE;
+    if (te->arrow_label)
+        gtk_label_set_text(GTK_LABEL(te->arrow_label), "\u2304");
+
+    /* Consume: the next permission shouldn't reuse this tool_id. */
+    g_free(priv->last_tool_id);
+    priv->last_tool_id = NULL;
+
+    scroll_to_bottom(priv);
+    return TRUE;
+}
+
 void chat_webview_show_permission(GtkWidget *webview,
                                   const gchar *request_id,
                                   const gchar *tool_name,
@@ -2292,6 +2497,27 @@ void chat_webview_show_permission(GtkWidget *webview,
     ChatViewPrivate *priv = get_priv(webview);
     if (!priv) return;
     WIDTH_DIAG_BEFORE(priv);
+
+    /* For edit-family tools with a recent diff block, attach inline
+     * Accept/Reject buttons to the diff instead of a separate card. */
+    {
+        JsonParser *jp_inline = json_parser_new();
+        JsonArray *opt_arr = NULL;
+        if (options_json && json_parser_load_from_data(
+                jp_inline, options_json, -1, NULL))
+        {
+            JsonNode *root = json_parser_get_root(jp_inline);
+            if (root && JSON_NODE_HOLDS_ARRAY(root))
+                opt_arr = json_node_get_array(root);
+        }
+        if (opt_arr &&
+            try_attach_inline_permission(priv, request_id, tool_name, opt_arr))
+        {
+            g_object_unref(jp_inline);
+            return;
+        }
+        g_object_unref(jp_inline);
+    }
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
     gtk_style_context_add_class(gtk_widget_get_style_context(box), "perm-card");
@@ -2670,6 +2896,8 @@ void chat_webview_clear(GtkWidget *webview)
     g_hash_table_remove_all(priv->thinking_widgets);
     g_list_free_full(priv->content_log, log_entry_free);
     priv->content_log = NULL;
+    g_free(priv->last_tool_id);
+    priv->last_tool_id = NULL;
 
     /* Show welcome again */
     if (priv->welcome)
@@ -2682,6 +2910,32 @@ void chat_webview_clear(GtkWidget *webview)
     g_list_free(children);
     gtk_widget_set_no_show_all(priv->todos_box, TRUE);
     gtk_widget_hide(priv->todos_box);
+}
+
+gboolean chat_webview_copy_last_response(GtkWidget *webview)
+{
+    ChatViewPrivate *priv = get_priv(webview);
+    if (!priv) return FALSE;
+
+    /* Walk the content_log tail-to-head looking for the most recent
+     * assistant LOG_MESSAGE. */
+    const gchar *found = NULL;
+    for (GList *l = g_list_last(priv->content_log); l; l = l->prev) {
+        LogEntry *e = l->data;
+        if (e->type == LOG_MESSAGE &&
+            g_strcmp0(e->role, "assistant") == 0 &&
+            e->content && e->content[0] != '\0')
+        {
+            found = e->content;
+            break;
+        }
+    }
+
+    if (!found) return FALSE;
+
+    GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+    gtk_clipboard_set_text(clip, found, -1);
+    return TRUE;
 }
 
 gchar *chat_webview_export_markdown(GtkWidget *webview)
@@ -2741,6 +2995,204 @@ gchar *chat_webview_export_markdown(GtkWidget *webview)
     }
 
     return g_string_free(md, FALSE);
+}
+
+/* ── HTML export ─────────────────────────────────────────────────── */
+
+/* Append `raw` to `out`, escaping HTML special characters. */
+static void append_html_escaped(GString *out, const gchar *raw)
+{
+    if (!raw) return;
+    for (const gchar *p = raw; *p; p++) {
+        switch (*p) {
+        case '&':  g_string_append(out, "&amp;");  break;
+        case '<':  g_string_append(out, "&lt;");   break;
+        case '>':  g_string_append(out, "&gt;");   break;
+        case '"':  g_string_append(out, "&quot;"); break;
+        case '\'': g_string_append(out, "&#39;");  break;
+        default:   g_string_append_c(out, *p);      break;
+        }
+    }
+}
+
+gchar *chat_webview_export_html(GtkWidget *webview)
+{
+    ChatViewPrivate *priv = get_priv(webview);
+    if (!priv) return g_strdup("");
+
+    GString *h = g_string_new(NULL);
+    g_string_append(h,
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\">\n"
+        "<head>\n"
+        "<meta charset=\"utf-8\">\n"
+        "<title>Geany Code — Conversation Export</title>\n"
+        "<style>\n"
+        "  :root {\n"
+        "    --bg:#1e1f22; --fg:#e6e6e6; --muted:#9aa0a6;\n"
+        "    --user:#4a7bd1; --assistant:#6ec56e; --system:#c78a3e;\n"
+        "    --card:#2a2c31; --border:#3b3d42; --code-bg:#141518;\n"
+        "  }\n"
+        "  @media (prefers-color-scheme: light) {\n"
+        "    :root {\n"
+        "      --bg:#fafafa; --fg:#1b1b1b; --muted:#5f6368;\n"
+        "      --user:#1a57c4; --assistant:#2f8a2f; --system:#a46a16;\n"
+        "      --card:#ffffff; --border:#dddfe3; --code-bg:#f2f3f5;\n"
+        "    }\n"
+        "  }\n"
+        "  html,body { background:var(--bg); color:var(--fg); }\n"
+        "  body {\n"
+        "    font-family: -apple-system, \"Segoe UI\", Cantarell,\n"
+        "                 \"Helvetica Neue\", Arial, sans-serif;\n"
+        "    margin:0; padding:2rem; line-height:1.55;\n"
+        "  }\n"
+        "  main { max-width:860px; margin:0 auto; }\n"
+        "  h1 { font-size:1.4rem; border-bottom:1px solid var(--border);\n"
+        "       padding-bottom:.5rem; margin-top:0; }\n"
+        "  .entry { border:1px solid var(--border); border-radius:8px;\n"
+        "           background:var(--card); padding:.9rem 1rem;\n"
+        "           margin:.75rem 0; }\n"
+        "  .entry .role { font-weight:600; font-size:.8rem;\n"
+        "                 text-transform:uppercase; letter-spacing:.05em;\n"
+        "                 margin-bottom:.4rem; }\n"
+        "  .entry.user .role { color:var(--user); }\n"
+        "  .entry.assistant .role { color:var(--assistant); }\n"
+        "  .entry.system .role { color:var(--system); }\n"
+        "  .entry .content { white-space:pre-wrap; word-wrap:break-word; }\n"
+        "  .tool { border-left:3px solid var(--muted); padding:.4rem .75rem;\n"
+        "          background:var(--code-bg); margin:.5rem 0;\n"
+        "          font-family: ui-monospace, SFMono-Regular, Menlo,\n"
+        "                       Consolas, monospace; font-size:.85rem; }\n"
+        "  .tool .tname { color:var(--user); font-weight:600; }\n"
+        "  details { margin:.5rem 0; }\n"
+        "  details summary { cursor:pointer; color:var(--muted);\n"
+        "                    font-size:.85rem; }\n"
+        "  pre { background:var(--code-bg); padding:.75rem; border-radius:6px;\n"
+        "        overflow-x:auto; font-size:.85rem; margin:.4rem 0; }\n"
+        "  .meta { color:var(--muted); font-size:.8rem;\n"
+        "          margin-bottom:1rem; }\n"
+        "</style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<main>\n"
+        "<h1>Conversation Export</h1>\n");
+
+    /* Meta: ISO 8601 timestamp of export. */
+    gchar *iso = g_date_time_format_iso8601(g_date_time_new_now_local());
+    g_string_append(h, "<div class=\"meta\">Exported ");
+    append_html_escaped(h, iso);
+    g_string_append(h, "</div>\n");
+    g_free(iso);
+
+    for (GList *l = priv->content_log; l; l = l->next) {
+        LogEntry *e = l->data;
+
+        switch (e->type) {
+        case LOG_MESSAGE: {
+            const gchar *role = e->role ? e->role : "system";
+            g_string_append_printf(h, "<div class=\"entry %s\">\n", role);
+            g_string_append(h, "  <div class=\"role\">");
+            append_html_escaped(h, role);
+            g_string_append(h, "</div>\n");
+            g_string_append(h, "  <div class=\"content\">");
+            append_html_escaped(h, e->content);
+            g_string_append(h, "</div>\n</div>\n");
+            break;
+        }
+        case LOG_TOOL_CALL:
+            g_string_append(h, "<div class=\"tool\"><span class=\"tname\">");
+            append_html_escaped(h, e->tool_name ? e->tool_name : "tool");
+            g_string_append(h, "</span>");
+            if (e->tool_input && e->tool_input[0]) {
+                g_string_append(h, " ");
+                append_html_escaped(h, e->tool_input);
+            }
+            g_string_append(h, "</div>\n");
+            break;
+        case LOG_TOOL_RESULT:
+            if (e->tool_result && e->tool_result[0]) {
+                g_string_append(h,
+                    "<details><summary>Tool result</summary><pre>");
+                append_html_escaped(h, e->tool_result);
+                g_string_append(h, "</pre></details>\n");
+            }
+            break;
+        case LOG_THINKING:
+            if (e->content && e->content[0]) {
+                g_string_append(h,
+                    "<details><summary>Thinking</summary><pre>");
+                append_html_escaped(h, e->content);
+                g_string_append(h, "</pre></details>\n");
+            }
+            break;
+        }
+    }
+
+    g_string_append(h, "</main>\n</body>\n</html>\n");
+    return g_string_free(h, FALSE);
+}
+
+/* ── JSON export ─────────────────────────────────────────────────── */
+
+static const gchar *log_entry_type_name(LogEntryType t)
+{
+    switch (t) {
+    case LOG_MESSAGE:     return "message";
+    case LOG_TOOL_CALL:   return "tool_call";
+    case LOG_TOOL_RESULT: return "tool_result";
+    case LOG_THINKING:    return "thinking";
+    }
+    return "unknown";
+}
+
+gchar *chat_webview_export_json(GtkWidget *webview)
+{
+    ChatViewPrivate *priv = get_priv(webview);
+    if (!priv) return g_strdup("[]");
+
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_array(b);
+
+    for (GList *l = priv->content_log; l; l = l->next) {
+        LogEntry *e = l->data;
+
+        json_builder_begin_object(b);
+        json_builder_set_member_name(b, "type");
+        json_builder_add_string_value(b, log_entry_type_name(e->type));
+
+        if (e->role) {
+            json_builder_set_member_name(b, "role");
+            json_builder_add_string_value(b, e->role);
+        }
+        if (e->content) {
+            json_builder_set_member_name(b, "content");
+            json_builder_add_string_value(b, e->content);
+        }
+        if (e->tool_name) {
+            json_builder_set_member_name(b, "tool_name");
+            json_builder_add_string_value(b, e->tool_name);
+        }
+        if (e->tool_input) {
+            json_builder_set_member_name(b, "tool_input");
+            json_builder_add_string_value(b, e->tool_input);
+        }
+        if (e->tool_result) {
+            json_builder_set_member_name(b, "tool_result");
+            json_builder_add_string_value(b, e->tool_result);
+        }
+        json_builder_end_object(b);
+    }
+    json_builder_end_array(b);
+
+    JsonGenerator *gen = json_generator_new();
+    json_generator_set_pretty(gen, TRUE);
+    json_generator_set_indent(gen, 2);
+    json_generator_set_root(gen, json_builder_get_root(b));
+    gchar *out = json_generator_to_data(gen, NULL);
+    g_object_unref(gen);
+    g_object_unref(b);
+
+    return out ? out : g_strdup("[]");
 }
 
 void chat_webview_apply_theme(GtkWidget *webview)

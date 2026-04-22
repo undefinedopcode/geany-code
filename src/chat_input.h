@@ -25,12 +25,23 @@ void chat_input_grab_focus(GtkWidget *input);
 /* Enable/disable send vs stop button */
 void chat_input_set_busy(GtkWidget *input, gboolean busy);
 
+/* Show/hide the streaming-response spinner (right side of the mode row). */
+void chat_input_set_streaming(GtkWidget *input, gboolean streaming);
+
 /* Set the active permission mode by ID */
 void chat_input_set_mode(GtkWidget *input, const gchar *mode_id);
 gchar *chat_input_get_mode(GtkWidget *input);
 
 /* Slash command completion — commands_json is a JSON array of {name, description} */
 void chat_input_set_commands(GtkWidget *input, const gchar *commands_json);
+
+/* Iterate the loaded slash commands (name + description). */
+typedef void (*ChatInputCommandIterCb)(const gchar *name,
+                                        const gchar *description,
+                                        gpointer user_data);
+void chat_input_foreach_command(GtkWidget *input,
+                                 ChatInputCommandIterCb cb,
+                                 gpointer user_data);
 
 /* Update the todos panel (shown above dropdowns when active) */
 void chat_input_update_todos(GtkWidget *input, const gchar *todos_json);

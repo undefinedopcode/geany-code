@@ -4,6 +4,7 @@
 #include "editor_bridge.h"
 #include "editor_dbus.h"
 #include "hooks_dialog.h"
+#include <string.h>
 
 GeanyPlugin    *geany_plugin;
 GeanyData      *geany_data;
@@ -16,6 +17,7 @@ enum {
     KB_FIND_BUGS,
     KB_FOCUS_INPUT,
     KB_ADD_CONTEXT,
+    KB_COMMAND_PALETTE,
     KB_COUNT
 };
 
@@ -43,6 +45,9 @@ static gboolean on_keybinding(guint key_id)
         return TRUE;
     case KB_ADD_CONTEXT:
         chat_widget_add_context_from_editor(geany_code->chat_widget);
+        return TRUE;
+    case KB_COMMAND_PALETTE:
+        chat_widget_show_command_palette(geany_code->chat_widget);
         return TRUE;
     }
     return FALSE;
@@ -76,6 +81,28 @@ static gboolean on_geany_key_press(GObject *obj, GdkEventKey *event,
         return FALSE;
 
     guint mod = event->state & gtk_accelerator_get_default_mod_mask();
+
+    /* Ctrl+Shift+P opens the command palette regardless of focus — runs
+     * before Geany's keybinding loop so Scintilla can't eat it. */
+    if ((event->keyval == GDK_KEY_p || event->keyval == GDK_KEY_P) &&
+        mod == (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+    {
+        chat_widget_show_command_palette(geany_code->chat_widget);
+        return TRUE;
+    }
+
+    /* Ctrl+Shift+Y copies the most-recent assistant response to the
+     * clipboard — a keyboard accelerator for the hover-reveal copy
+     * button on each assistant message. */
+    if ((event->keyval == GDK_KEY_y || event->keyval == GDK_KEY_Y) &&
+        mod == (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+    {
+        if (chat_widget_copy_last_response(geany_code->chat_widget))
+            msgwin_status_add(
+                "[geany-code] Copied last response to clipboard");
+        return TRUE;
+    }
+
     gboolean is_paste = (event->keyval == GDK_KEY_v || event->keyval == GDK_KEY_V) &&
                         (mod == GDK_CONTROL_MASK || mod == GDK_MOD1_MASK);
     if (!is_paste)
@@ -103,7 +130,57 @@ static gboolean on_geany_key_press(GObject *obj, GdkEventKey *event,
     return FALSE;
 }
 
+/* ── Editor context menu ─────────────────────────────────────────── */
+
+/* Items we append to Geany's editor context menu. Sensitivity is updated
+ * in on_update_editor_menu based on whether the active document has a
+ * selection. */
+typedef struct {
+    GtkWidget *separator;
+    GtkWidget *add_context;
+    GtkWidget *explain;
+    GtkWidget *find_bugs;
+    GtkWidget *improve;
+    GtkWidget *send_selection;
+} EditorMenuItems;
+
+static EditorMenuItems editor_menu_items = {0};
+
+static void on_update_editor_menu(GObject *obj,
+                                   const gchar *word,
+                                   gint pos,
+                                   GeanyDocument *doc,
+                                   gpointer user_data)
+{
+    (void)obj; (void)word; (void)pos; (void)user_data;
+
+    gboolean has_selection = FALSE;
+    if (doc && doc->is_valid) {
+        ScintillaObject *sci = doc->editor->sci;
+        has_selection = sci_has_selection(sci);
+    }
+
+    GtkWidget *items[] = {
+        editor_menu_items.add_context,
+        editor_menu_items.explain,
+        editor_menu_items.find_bugs,
+        editor_menu_items.improve,
+        editor_menu_items.send_selection,
+        NULL
+    };
+    for (GtkWidget **w = items; *w; w++)
+        gtk_widget_set_sensitive(*w, has_selection);
+}
+
 /* ── Menu callbacks ──────────────────────────────────────────────── */
+
+static void on_send_selection(GtkMenuItem *item, gpointer data)
+{
+    (void)item; (void)data;
+    GeanyDocument *doc = document_get_current();
+    if (doc && doc->is_valid)
+        chat_widget_send_selection(geany_code->chat_widget, doc);
+}
 
 static void on_explain_code(GtkMenuItem *item, gpointer data)
 {
@@ -169,7 +246,7 @@ static gboolean gc_init(GeanyPlugin *plugin, gpointer pdata)
 
     /* Add to message window (bottom panel) */
     geany_code->sidebar_page = geany_code->chat_widget;
-    GtkWidget *label = gtk_label_new("Claude Code");
+    GtkWidget *label = gtk_label_new("Geany Code");
     gtk_notebook_append_page(
         GTK_NOTEBOOK(geany->main_widgets->message_window_notebook),
         geany_code->sidebar_page,
@@ -228,12 +305,68 @@ static gboolean gc_init(GeanyPlugin *plugin, gpointer pdata)
     keybindings_set_item(kg, KB_ADD_CONTEXT, NULL,
                          GDK_KEY_a, GDK_MOD1_MASK,
                          "add_context", "Add Selection to Claude Context", NULL);
+    keybindings_set_item(kg, KB_COMMAND_PALETTE, NULL,
+                         GDK_KEY_P,
+                         GDK_CONTROL_MASK | GDK_SHIFT_MASK,
+                         "command_palette", "Claude Command Palette", NULL);
 
     /* Hook Ctrl+V / Alt+V for paste in our input — fires before Geany's
      * keybinding loop so we can intercept Ctrl+V.  Auto-disconnects on
      * plugin unload. */
     plugin_signal_connect(plugin, geany_data->object, "key-press", FALSE,
                           G_CALLBACK(on_geany_key_press), NULL);
+
+    /* Editor context menu: add a "Claude Code" section with selection
+     * quick-actions. Sensitivity is driven by on_update_editor_menu. */
+    GtkWidget *emenu = geany->main_widgets->editor_menu;
+    editor_menu_items.separator = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(emenu),
+                          editor_menu_items.separator);
+
+    editor_menu_items.add_context =
+        gtk_menu_item_new_with_label("Add Selection to Claude Context");
+    g_signal_connect(editor_menu_items.add_context, "activate",
+                     G_CALLBACK(on_add_to_context), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(emenu),
+                          editor_menu_items.add_context);
+
+    editor_menu_items.send_selection =
+        gtk_menu_item_new_with_label("Send Selection to Claude");
+    g_signal_connect(editor_menu_items.send_selection, "activate",
+                     G_CALLBACK(on_send_selection), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(emenu),
+                          editor_menu_items.send_selection);
+
+    editor_menu_items.explain =
+        gtk_menu_item_new_with_label("Explain with Claude");
+    g_signal_connect(editor_menu_items.explain, "activate",
+                     G_CALLBACK(on_explain_code), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(emenu),
+                          editor_menu_items.explain);
+
+    editor_menu_items.find_bugs =
+        gtk_menu_item_new_with_label("Find Bugs with Claude");
+    g_signal_connect(editor_menu_items.find_bugs, "activate",
+                     G_CALLBACK(on_find_bugs), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(emenu),
+                          editor_menu_items.find_bugs);
+
+    editor_menu_items.improve =
+        gtk_menu_item_new_with_label("Suggest Improvements with Claude");
+    g_signal_connect(editor_menu_items.improve, "activate",
+                     G_CALLBACK(on_suggest_improvements), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(emenu),
+                          editor_menu_items.improve);
+
+    gtk_widget_show(editor_menu_items.separator);
+    gtk_widget_show(editor_menu_items.add_context);
+    gtk_widget_show(editor_menu_items.send_selection);
+    gtk_widget_show(editor_menu_items.explain);
+    gtk_widget_show(editor_menu_items.find_bugs);
+    gtk_widget_show(editor_menu_items.improve);
+
+    plugin_signal_connect(plugin, geany_data->object, "update-editor-menu",
+                          FALSE, G_CALLBACK(on_update_editor_menu), NULL);
 
     return TRUE;
 }
@@ -269,6 +402,20 @@ static void gc_cleanup(GeanyPlugin *plugin, gpointer pdata)
     /* Remove menu item */
     if (geany_code->menu_item)
         gtk_widget_destroy(geany_code->menu_item);
+
+    /* Remove editor context menu items */
+    GtkWidget *emenu_items[] = {
+        editor_menu_items.separator,
+        editor_menu_items.add_context,
+        editor_menu_items.send_selection,
+        editor_menu_items.explain,
+        editor_menu_items.find_bugs,
+        editor_menu_items.improve,
+        NULL
+    };
+    for (GtkWidget **w = emenu_items; *w; w++)
+        gtk_widget_destroy(*w);
+    memset(&editor_menu_items, 0, sizeof(editor_menu_items));
 
     g_free(geany_code);
     geany_code = NULL;

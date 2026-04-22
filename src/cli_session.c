@@ -57,6 +57,13 @@ struct _CLISession {
     gpointer       error_data;
     CLIFinishedCb  finished_cb;
     gpointer       finished_data;
+    CLIStreamingCb streaming_cb;
+    gpointer       streaming_data;
+    gboolean       streaming_active;
+    gboolean       finished_dispatched;
+    CLIUsageCb     usage_cb;
+    gpointer       usage_data;
+    gchar         *current_model;  /* model name from init/set_model */
 };
 
 /* ── Forward declarations ────────────────────────────────────────── */
@@ -97,6 +104,7 @@ void cli_session_free(CLISession *session)
     g_free(session->permission_mode);
     g_free(session->mcp_config_path);
     g_free(session->working_dir);
+    g_free(session->current_model);
     g_free(session);
 }
 
@@ -169,8 +177,8 @@ gboolean cli_session_start(CLISession *session, const gchar *working_dir)
 
     {
         gchar *mcp_json = g_strdup_printf(
-            "{\"mcpServers\":{\"geany\":{\"command\":\"%s\",\"args\":[]}}}\n",
-            GEANY_CODE_MCP_SERVER);
+            "{\"mcpServers\":{\"geany\":{\"command\":\"%s\",\"args\":[\"--instance\",\"%u\"]}}}\n",
+            GEANY_CODE_MCP_SERVER, (guint)getpid());
 
         GError *werr = NULL;
         g_file_set_contents(session->mcp_config_path, mcp_json, -1, &werr);
@@ -233,6 +241,7 @@ gboolean cli_session_start(CLISession *session, const gchar *working_dir)
     session->stdout_pipe = g_subprocess_get_stdout_pipe(session->process);
     session->stdout_reader = g_data_input_stream_new(session->stdout_pipe);
     session->running = TRUE;
+    session->finished_dispatched = FALSE;
 
     /* Also read stderr for diagnostics */
     GInputStream *stderr_pipe = g_subprocess_get_stderr_pipe(session->process);
@@ -422,6 +431,9 @@ void cli_session_set_model(CLISession *session, const gchar *model_value)
 
     DBG("Switching model to: %s", model_value);
 
+    g_free(session->current_model);
+    session->current_model = g_strdup(model_value);
+
     gchar *json = g_strdup_printf(
         "{\"type\":\"control_request\","
         "\"request_id\":\"model_%ld\","
@@ -513,8 +525,14 @@ void cli_session_respond_permission(CLISession *session,
 
     /* Determine suggestion index if this is a suggestion response */
     gint suggestion_idx = -1;
-    if (g_str_has_prefix(option_id, "suggestion_"))
-        suggestion_idx = atoi(option_id + strlen("suggestion_"));
+    if (g_str_has_prefix(option_id, "suggestion_")) {
+        const gchar *num = option_id + strlen("suggestion_");
+        gchar *endp = NULL;
+        glong parsed = (num[0] != '\0') ? strtol(num, &endp, 10) : 0;
+        if (num[0] != '\0' && endp && *endp == '\0' &&
+            parsed >= 0 && parsed < G_MAXINT)
+            suggestion_idx = (gint)parsed;
+    }
 
     /* Build the control_response envelope */
     JsonBuilder *b = json_builder_new();
@@ -652,19 +670,40 @@ static void on_line_read(GObject *source, GAsyncResult *result, gpointer data)
 
     if (error) {
         DBG("stdout read error: %s", error->message);
-        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-            if (session->error_cb)
-                session->error_cb(error->message, session->error_data);
-        }
+        gboolean cancelled = g_error_matches(error, G_IO_ERROR,
+                                             G_IO_ERROR_CANCELLED);
+        if (!cancelled && session->error_cb)
+            session->error_cb(error->message, session->error_data);
         g_error_free(error);
+        if (!cancelled) {
+            session->running = FALSE;
+            if (session->streaming_active) {
+                session->streaming_active = FALSE;
+                if (session->streaming_cb)
+                    session->streaming_cb(FALSE, session->streaming_data);
+            }
+            if (!session->finished_dispatched) {
+                session->finished_dispatched = TRUE;
+                if (session->finished_cb)
+                    session->finished_cb(session->finished_data);
+            }
+        }
         return;
     }
 
     if (!line) {
         DBG("stdout EOF - claude process ended");
         session->running = FALSE;
-        if (session->finished_cb)
-            session->finished_cb(session->finished_data);
+        if (session->streaming_active) {
+            session->streaming_active = FALSE;
+            if (session->streaming_cb)
+                session->streaming_cb(FALSE, session->streaming_data);
+        }
+        if (!session->finished_dispatched) {
+            session->finished_dispatched = TRUE;
+            if (session->finished_cb)
+                session->finished_cb(session->finished_data);
+        }
         return;
     }
 
@@ -782,6 +821,11 @@ static void process_json_line(CLISession *session, const gchar *line)
         DBG("Model: %s", model ? model : "(null)");
         DBG("Permission mode: %s", perm_mode ? perm_mode : "(null)");
 
+        if (model) {
+            g_free(session->current_model);
+            session->current_model = g_strdup(model);
+        }
+
         if (perm_mode && !session->permission_mode) {
             session->permission_mode = g_strdup(perm_mode);
         }
@@ -813,18 +857,25 @@ static void process_json_line(CLISession *session, const gchar *line)
         }
 
         /* Extract MCP server status */
-        if (json_object_has_member(obj, "mcp_servers") && session->mcp_status_cb) {
-            JsonArray *mcp = json_object_get_array_member(obj, "mcp_servers");
-            DBG("MCP servers: %u", json_array_get_length(mcp));
-            JsonGenerator *mg = json_generator_new();
-            JsonNode *mnode = json_node_new(JSON_NODE_ARRAY);
-            json_node_set_array(mnode, mcp);
-            json_generator_set_root(mg, mnode);
-            gchar *mjson = json_generator_to_data(mg, NULL);
-            session->mcp_status_cb(mjson, session->mcp_status_data);
-            g_free(mjson);
-            json_node_free(mnode);
-            g_object_unref(mg);
+        if (session->mcp_status_cb &&
+            json_object_has_member(obj, "mcp_servers"))
+        {
+            JsonNode *mcp_node = json_object_get_member(obj, "mcp_servers");
+            if (mcp_node && JSON_NODE_HOLDS_ARRAY(mcp_node)) {
+                JsonArray *mcp = json_node_get_array(mcp_node);
+                DBG("MCP servers: %u", json_array_get_length(mcp));
+                JsonGenerator *mg = json_generator_new();
+                JsonNode *mnode = json_node_new(JSON_NODE_ARRAY);
+                json_node_set_array(mnode, mcp);
+                json_generator_set_root(mg, mnode);
+                gchar *mjson = json_generator_to_data(mg, NULL);
+                if (mjson) {
+                    session->mcp_status_cb(mjson, session->mcp_status_data);
+                    g_free(mjson);
+                }
+                json_node_free(mnode);
+                g_object_unref(mg);
+            }
         }
 
         /* Create a placeholder message for streaming into */
@@ -1006,8 +1057,14 @@ static void process_json_line(CLISession *session, const gchar *line)
             g_string_free(result_text, TRUE);
         }
 
-    /* stream_event — ignored since --include-partial-messages gives us
-     * the full accumulated text in assistant events already */
+    } else if (g_strcmp0(type, "stream_event") == 0) {
+        /* Raw API streaming chunk — content is accumulated and surfaced
+         * via the assistant event, but we use the chunk arrival to drive
+         * a "receiving response" indicator in the UI. */
+        if (!session->streaming_active && session->streaming_cb) {
+            session->streaming_active = TRUE;
+            session->streaming_cb(TRUE, session->streaming_data);
+        }
 
     } else if (g_strcmp0(type, "control_request") == 0) {
         /* Permission prompt from claude */
@@ -1322,6 +1379,45 @@ static void process_json_line(CLISession *session, const gchar *line)
         session->current_msg_id = NULL;
         g_string_truncate(session->current_content, 0);
 
+        if (session->streaming_active) {
+            session->streaming_active = FALSE;
+            if (session->streaming_cb)
+                session->streaming_cb(FALSE, session->streaming_data);
+        }
+
+        /* Emit usage stats from the result event. Claude CLI reports
+         * per-turn usage under `usage` and a per-turn cost under
+         * `total_cost_usd` (sometimes `cost_usd`). */
+        if (session->usage_cb && json_object_has_member(obj, "usage")) {
+            JsonNode *unode = json_object_get_member(obj, "usage");
+            if (unode && JSON_NODE_HOLDS_OBJECT(unode)) {
+                JsonObject *u = json_node_get_object(unode);
+                gint64 in_tok = json_object_has_member(u, "input_tokens")
+                    ? json_object_get_int_member(u, "input_tokens") : 0;
+                gint64 out_tok = json_object_has_member(u, "output_tokens")
+                    ? json_object_get_int_member(u, "output_tokens") : 0;
+                gint64 cc_tok = json_object_has_member(
+                        u, "cache_creation_input_tokens")
+                    ? json_object_get_int_member(
+                        u, "cache_creation_input_tokens") : 0;
+                gint64 cr_tok = json_object_has_member(
+                        u, "cache_read_input_tokens")
+                    ? json_object_get_int_member(
+                        u, "cache_read_input_tokens") : 0;
+
+                gdouble cost = -1.0;
+                if (json_object_has_member(obj, "total_cost_usd"))
+                    cost = json_object_get_double_member(obj,
+                                                          "total_cost_usd");
+                else if (json_object_has_member(obj, "cost_usd"))
+                    cost = json_object_get_double_member(obj, "cost_usd");
+
+                session->usage_cb(in_tok, out_tok, cc_tok, cr_tok,
+                                   cost, session->current_model,
+                                   session->usage_data);
+            }
+        }
+
         DBG("Prompt complete (subtype=%s)", subtype);
     }
     /* rate_limit_event - ignored */
@@ -1467,4 +1563,18 @@ void cli_session_set_finished_callback(CLISession *session, CLIFinishedCb cb,
 {
     session->finished_cb = cb;
     session->finished_data = data;
+}
+
+void cli_session_set_streaming_callback(CLISession *session, CLIStreamingCb cb,
+                                         gpointer data)
+{
+    session->streaming_cb = cb;
+    session->streaming_data = data;
+}
+
+void cli_session_set_usage_callback(CLISession *session, CLIUsageCb cb,
+                                     gpointer data)
+{
+    session->usage_cb = cb;
+    session->usage_data = data;
 }

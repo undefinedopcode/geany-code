@@ -11,20 +11,27 @@
 #include <string.h>
 
 static GDBusProxy *editor_proxy = NULL;
+static gchar *instance_id = NULL;
 
 /* ── DBus helpers ────────────────────────────────────────────────── */
 
 static gboolean connect_dbus(void)
 {
+    gchar *bus_name = g_strdup_printf("org.geanycode.editor.i%s", instance_id);
+    gchar *obj_path = g_strdup_printf("/GeanyCode/Editor/i%s", instance_id);
+
     GError *error = NULL;
     editor_proxy = g_dbus_proxy_new_for_bus_sync(
         G_BUS_TYPE_SESSION,
         G_DBUS_PROXY_FLAGS_NONE,
         NULL,
-        "org.geanycode.editor",
-        "/GeanyCode/Editor",
+        bus_name,
+        obj_path,
         "org.geanycode.Editor",
         NULL, &error);
+
+    g_free(bus_name);
+    g_free(obj_path);
 
     if (error) {
         g_printerr("Failed to connect to Geany DBus: %s\n", error->message);
@@ -116,13 +123,47 @@ static void send_error(gint64 id, gint code, const gchar *message)
 
 /* ── DBus call helper ────────────────────────────────────────────── */
 
+static gboolean dbus_error_is_transport(GError *error)
+{
+    return g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_NO_REPLY) ||
+           g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_DISCONNECTED) ||
+           g_error_matches(error, G_DBUS_ERROR,
+                           G_DBUS_ERROR_SERVICE_UNKNOWN) ||
+           g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_NAME_HAS_NO_OWNER);
+}
+
 static GVariant *call_dbus(const gchar *method, GVariant *params,
                            gint64 mcp_id)
 {
+    /* Lazy (re)connect if the proxy is missing (e.g. Geany wasn't ready
+     * at server startup, or the bus disconnected since). */
+    if (!editor_proxy && !connect_dbus()) {
+        send_error(mcp_id, -32000,
+                   "Geany D-Bus service not available");
+        return NULL;
+    }
+
     GError *error = NULL;
     GVariant *result = g_dbus_proxy_call_sync(
         editor_proxy, method, params,
         G_DBUS_CALL_FLAGS_NONE, 30000, NULL, &error);
+
+    if (error && dbus_error_is_transport(error)) {
+        g_error_free(error);
+        error = NULL;
+        g_clear_object(&editor_proxy);
+        if (connect_dbus()) {
+            /* g_dbus_proxy_call_sync sank the params; we can't retry with
+             * the same GVariant, so surface a clearer error. Next call
+             * will go through on the fresh proxy. */
+            send_error(mcp_id, -32000,
+                       "Geany D-Bus proxy was stale; reconnected — retry.");
+            return NULL;
+        }
+        send_error(mcp_id, -32000,
+                   "Geany D-Bus service not available");
+        return NULL;
+    }
 
     if (error) {
         send_error(mcp_id, -32000, error->message);
@@ -231,11 +272,11 @@ static void handle_tools_list(gint64 id)
     add_tool(b, "geanycode_edit",
         "PREFERRED over the built-in Edit tool. "
         "Edit a file via Geany editor — applies the edit in the IDE so the user sees changes in real time. "
-        "Returns the matched line number for diff display. The old_text must be a unique exact match.",
+        "Returns the matched line number for diff display. The old_string must be a unique exact match.",
         "{\"file_path\":{\"type\":\"string\",\"description\":\"Absolute path to the file\"},"
-        "\"old_text\":{\"type\":\"string\",\"description\":\"Exact text to find and replace (must be unique)\"},"
-        "\"new_text\":{\"type\":\"string\",\"description\":\"Replacement text\"}}",
-        "[\"file_path\",\"old_text\",\"new_text\"]");
+        "\"old_string\":{\"type\":\"string\",\"description\":\"Exact text to find and replace (must be unique)\"},"
+        "\"new_string\":{\"type\":\"string\",\"description\":\"Replacement text\"}}",
+        "[\"file_path\",\"old_string\",\"new_string\"]");
 
     add_tool(b, "geanycode_write",
         "PREFERRED over the built-in Write tool. "
@@ -347,10 +388,25 @@ static void handle_tools_call(gint64 id, JsonObject *params)
     } else if (g_strcmp0(name, "geanycode_edit") == 0) {
         const gchar *fp = args && json_object_has_member(args, "file_path")
             ? json_object_get_string_member(args, "file_path") : "";
-        const gchar *old_text = args && json_object_has_member(args, "old_text")
-            ? json_object_get_string_member(args, "old_text") : "";
-        const gchar *new_text = args && json_object_has_member(args, "new_text")
-            ? json_object_get_string_member(args, "new_text") : "";
+        /* Accept either `old_string`/`new_string` (Claude Edit convention)
+         * or the legacy `old_text`/`new_text` names. */
+        const gchar *old_text = NULL;
+        if (args && json_object_has_member(args, "old_string"))
+            old_text = json_object_get_string_member(args, "old_string");
+        else if (args && json_object_has_member(args, "old_text"))
+            old_text = json_object_get_string_member(args, "old_text");
+
+        const gchar *new_text = NULL;
+        if (args && json_object_has_member(args, "new_string"))
+            new_text = json_object_get_string_member(args, "new_string");
+        else if (args && json_object_has_member(args, "new_text"))
+            new_text = json_object_get_string_member(args, "new_text");
+
+        if (!fp || !*fp || !old_text || !*old_text || !new_text) {
+            send_error(id, -32602,
+                "geanycode_edit requires file_path, old_string, new_string");
+            return;
+        }
 
         GVariant *result = call_dbus("EditDocument",
             g_variant_new("(sss)", fp, old_text, new_text), id);
@@ -479,7 +535,14 @@ static void handle_tools_call(gint64 id, JsonObject *params)
         gchar *questions_json = json_generator_to_data(qg, NULL);
         g_object_unref(qg);
 
-        /* Call DBus — this blocks until user responds (up to 5 min) */
+        /* Call DBus — this blocks until user responds (up to 5 min).
+         * Lazy-connect if the proxy was never established. */
+        if (!editor_proxy && !connect_dbus()) {
+            g_free(questions_json);
+            send_error(id, -32000, "Geany D-Bus service not available");
+            return;
+        }
+
         GError *error = NULL;
         GVariant *result = g_dbus_proxy_call_sync(
             editor_proxy, "AskUserQuestion",
@@ -544,12 +607,20 @@ static void process_message(const gchar *line)
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
-
-    if (!connect_dbus()) {
-        g_printerr("geany-code-mcp-server: cannot connect to Geany DBus\n");
+    for (int i = 1; i < argc - 1; i++) {
+        if (g_strcmp0(argv[i], "--instance") == 0) {
+            instance_id = argv[++i];
+            break;
+        }
+    }
+    if (!instance_id) {
+        g_printerr("geany-code-mcp-server: --instance <id> is required\n");
         return 1;
     }
+
+    /* Best-effort connect. If Geany's D-Bus service isn't ready yet, we'll
+     * reconnect lazily on the first tool call (see call_dbus). */
+    (void)connect_dbus();
 
     char buf[1024 * 1024];
     while (fgets(buf, sizeof(buf), stdin)) {
@@ -560,6 +631,6 @@ int main(int argc, char **argv)
             process_message(buf);
     }
 
-    g_object_unref(editor_proxy);
+    g_clear_object(&editor_proxy);
     return 0;
 }

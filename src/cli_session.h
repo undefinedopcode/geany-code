@@ -78,6 +78,27 @@ typedef void (*CLIThinkingCb)(const gchar *msg_id, guint fragment_index,
 typedef void (*CLIMcpStatusCb)(const gchar *servers_json, gpointer user_data);
 typedef void (*CLIErrorCb)(const gchar *error_msg, gpointer user_data);
 typedef void (*CLIFinishedCb)(gpointer user_data);
+/* Fires TRUE when raw streaming chunks start arriving from the CLI,
+ * and FALSE when the prompt completes (result event) or errors out.
+ * Used to drive a streaming-activity indicator. */
+typedef void (*CLIStreamingCb)(gboolean active, gpointer user_data);
+
+/* Per-turn usage stats from a `result` event.
+ *   input_tokens        — prompt tokens for this turn (cache-read excluded)
+ *   output_tokens       — generated tokens for this turn
+ *   cache_creation_tokens — tokens written to prompt cache this turn
+ *   cache_read_tokens   — tokens read from prompt cache this turn
+ *   cost_usd            — Anthropic-reported cost; <0 if the CLI didn't
+ *                         provide one (caller may estimate).
+ *   model               — model name in use this turn (for rate lookup);
+ *                         may be NULL. */
+typedef void (*CLIUsageCb)(gint64 input_tokens,
+                           gint64 output_tokens,
+                           gint64 cache_creation_tokens,
+                           gint64 cache_read_tokens,
+                           gdouble cost_usd,
+                           const gchar *model,
+                           gpointer user_data);
 
 void cli_session_set_message_callback(CLISession *session, CLIMessageCb cb,
                                       gpointer data);
@@ -105,5 +126,9 @@ void cli_session_set_error_callback(CLISession *session, CLIErrorCb cb,
                                     gpointer data);
 void cli_session_set_finished_callback(CLISession *session, CLIFinishedCb cb,
                                        gpointer data);
+void cli_session_set_streaming_callback(CLISession *session, CLIStreamingCb cb,
+                                         gpointer data);
+void cli_session_set_usage_callback(CLISession *session, CLIUsageCb cb,
+                                     gpointer data);
 
 #endif /* GEANY_CODE_CLI_SESSION_H */

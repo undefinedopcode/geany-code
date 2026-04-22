@@ -4,6 +4,8 @@
 #include "cli_session.h"
 #include "editor_bridge.h"
 #include "session_picker.h"
+#include "hooks_dialog.h"
+#include "plugin.h"
 #include <json-glib/json-glib.h>
 #include <string.h>
 
@@ -40,6 +42,16 @@ typedef struct {
     GtkWidget   *mcp_popover;    /* GtkPopover with server list */
     GtkWidget   *mcp_list_box;   /* GtkListBox inside popover */
     gchar       *mcp_servers_json; /* cached latest status JSON */
+
+    /* Cumulative usage tracker */
+    GtkWidget   *usage_indicator; /* statusbar-style button in header */
+    gint64       total_input_tokens;
+    gint64       total_output_tokens;
+    gint64       total_cache_creation_tokens;
+    gint64       total_cache_read_tokens;
+    gdouble      total_cost_usd;       /* sum of CLI-reported costs */
+    gdouble      estimated_cost_usd;   /* our estimate when CLI didn't report */
+    gchar       *last_model;           /* most recent model name seen */
 } ChatWidgetPrivate;
 
 static const gchar *CHAT_PRIV_KEY = "geany-code-chat-private";
@@ -91,11 +103,26 @@ static void track_edit(ChatWidgetPrivate *priv,
                        const gchar *tool_name,
                        const gchar *input_json)
 {
-    gboolean is_edit = tool_name &&
-        (g_strcmp0(tool_name, "Edit") == 0 || strstr(tool_name, "edit") != NULL);
-    gboolean is_write = tool_name &&
-        (g_strcmp0(tool_name, "Write") == 0 ||
-         (strstr(tool_name, "write") != NULL && !strstr(tool_name, "Todo")));
+    static const gchar *EDIT_TOOLS[] = {
+        "Edit", "MultiEdit",
+        "mcp__geany__geanycode_edit",
+        NULL
+    };
+    static const gchar *WRITE_TOOLS[] = {
+        "Write",
+        "mcp__geany__geanycode_write",
+        NULL
+    };
+
+    gboolean is_edit = FALSE, is_write = FALSE;
+    if (tool_name) {
+        for (const gchar **t = EDIT_TOOLS; *t; t++) {
+            if (g_strcmp0(tool_name, *t) == 0) { is_edit = TRUE; break; }
+        }
+        for (const gchar **t = WRITE_TOOLS; *t; t++) {
+            if (g_strcmp0(tool_name, *t) == 0) { is_write = TRUE; break; }
+        }
+    }
     if (!is_edit && !is_write) return;
     if (!input_json) return;
 
@@ -556,6 +583,8 @@ static void on_cli_message(const gchar *msg_id, const gchar *role,
                                     content ? content : "", is_streaming);
     }
 
+    chat_input_set_streaming(priv->input, is_streaming);
+
     if (!is_streaming)
         chat_input_set_busy(priv->input, FALSE);
 }
@@ -602,12 +631,155 @@ static void on_model_changed(const gchar *model_value, gpointer user_data)
     cli_session_set_model(priv->session, model_value);
 }
 
+/* ── Usage tracker ───────────────────────────────────────────────── */
+
+/* Format a token count compactly: 1234 → "1.2k", 1_234_567 → "1.2M". */
+static void format_tokens(gint64 n, gchar *out, gsize out_len)
+{
+    if (n < 1000)
+        g_snprintf(out, out_len, "%" G_GINT64_FORMAT, n);
+    else if (n < 1000000)
+        g_snprintf(out, out_len, "%.1fk", (gdouble)n / 1000.0);
+    else
+        g_snprintf(out, out_len, "%.2fM", (gdouble)n / 1000000.0);
+}
+
+/* Return an estimated cost for a turn in USD given per-turn token counts.
+ * Rates are per 1M tokens. Returns -1 if the model is unknown. */
+static gdouble estimate_turn_cost(const gchar *model,
+                                   gint64 in_tok, gint64 out_tok,
+                                   gint64 cc_tok, gint64 cr_tok)
+{
+    /* Identify model family. Claude CLI reports IDs like
+     * "claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-4-5".
+     * We match on the family substring. */
+    gdouble in_rate = -1, out_rate = -1;
+    if (model) {
+        if (strstr(model, "opus"))        { in_rate = 15.00; out_rate = 75.00; }
+        else if (strstr(model, "sonnet")) { in_rate =  3.00; out_rate = 15.00; }
+        else if (strstr(model, "haiku"))  { in_rate =  0.80; out_rate =  4.00; }
+    }
+    if (in_rate < 0)
+        return -1;
+
+    const gdouble cache_write_mult = 1.25;
+    const gdouble cache_read_mult  = 0.10;
+
+    gdouble cost = 0;
+    cost += (gdouble)in_tok  * in_rate  / 1000000.0;
+    cost += (gdouble)out_tok * out_rate / 1000000.0;
+    cost += (gdouble)cc_tok  * in_rate * cache_write_mult / 1000000.0;
+    cost += (gdouble)cr_tok  * in_rate * cache_read_mult  / 1000000.0;
+    return cost;
+}
+
+static void update_usage_indicator(ChatWidgetPrivate *priv)
+{
+    gint64 total_in = priv->total_input_tokens +
+                      priv->total_cache_creation_tokens +
+                      priv->total_cache_read_tokens;
+    gint64 total_out = priv->total_output_tokens;
+
+    if (total_in == 0 && total_out == 0) {
+        gtk_widget_hide(priv->usage_indicator);
+        return;
+    }
+
+    gchar in_str[32], out_str[32];
+    format_tokens(total_in, in_str, sizeof(in_str));
+    format_tokens(total_out, out_str, sizeof(out_str));
+
+    gdouble cost = (priv->total_cost_usd > 0)
+                   ? priv->total_cost_usd
+                   : priv->estimated_cost_usd;
+    gboolean estimated = (priv->total_cost_usd <= 0);
+
+    gchar *markup;
+    if (cost > 0) {
+        markup = g_markup_printf_escaped(
+            "<span size=\"small\">↑%s ↓%s  %s$%.3f</span>",
+            in_str, out_str,
+            estimated ? "~" : "",
+            cost);
+    } else {
+        markup = g_markup_printf_escaped(
+            "<span size=\"small\">↑%s ↓%s</span>", in_str, out_str);
+    }
+
+    GtkWidget *child = gtk_bin_get_child(GTK_BIN(priv->usage_indicator));
+    gtk_label_set_markup(GTK_LABEL(child), markup);
+    g_free(markup);
+
+    /* Tooltip: per-category breakdown + model */
+    GString *tip = g_string_new("Cumulative session usage");
+    g_string_append_printf(tip,
+        "\nInput tokens:        %" G_GINT64_FORMAT
+        "\nOutput tokens:       %" G_GINT64_FORMAT
+        "\nCache-write tokens:  %" G_GINT64_FORMAT
+        "\nCache-read tokens:   %" G_GINT64_FORMAT,
+        priv->total_input_tokens,
+        priv->total_output_tokens,
+        priv->total_cache_creation_tokens,
+        priv->total_cache_read_tokens);
+    if (priv->total_cost_usd > 0)
+        g_string_append_printf(tip,
+            "\nReported cost:       $%.4f", priv->total_cost_usd);
+    if (priv->estimated_cost_usd > 0 && priv->total_cost_usd <= 0)
+        g_string_append_printf(tip,
+            "\nEstimated cost:      $%.4f (tilde indicates estimate)",
+            priv->estimated_cost_usd);
+    if (priv->last_model)
+        g_string_append_printf(tip, "\nModel:               %s",
+                                priv->last_model);
+    gtk_widget_set_tooltip_text(priv->usage_indicator, tip->str);
+    g_string_free(tip, TRUE);
+
+    gtk_widget_show(priv->usage_indicator);
+}
+
+static void on_cli_usage(gint64 input_tokens,
+                          gint64 output_tokens,
+                          gint64 cache_creation_tokens,
+                          gint64 cache_read_tokens,
+                          gdouble cost_usd,
+                          const gchar *model,
+                          gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+
+    priv->total_input_tokens          += input_tokens;
+    priv->total_output_tokens         += output_tokens;
+    priv->total_cache_creation_tokens += cache_creation_tokens;
+    priv->total_cache_read_tokens     += cache_read_tokens;
+
+    if (cost_usd > 0) {
+        priv->total_cost_usd += cost_usd;
+    } else {
+        gdouble est = estimate_turn_cost(model,
+            input_tokens, output_tokens,
+            cache_creation_tokens, cache_read_tokens);
+        if (est > 0)
+            priv->estimated_cost_usd += est;
+    }
+
+    if (model) {
+        g_free(priv->last_model);
+        priv->last_model = g_strdup(model);
+    }
+
+    update_usage_indicator(priv);
+}
+
 static void on_cli_init(const gchar *model, const gchar *permission_mode,
                         gpointer user_data)
 {
     ChatWidgetPrivate *priv = user_data;
     if (permission_mode)
         chat_input_set_mode(priv->input, permission_mode);
+    if (model) {
+        g_free(priv->last_model);
+        priv->last_model = g_strdup(model);
+    }
 }
 
 static void on_cli_models(const gchar *models_json, gpointer user_data)
@@ -635,6 +807,7 @@ static void on_cli_thinking(const gchar *msg_id, guint fragment_index,
     ChatWidgetPrivate *priv = user_data;
     chat_webview_add_thinking(priv->webview, msg_id, fragment_index,
                               text, is_streaming);
+    chat_input_set_streaming(priv->input, is_streaming);
 }
 
 static void on_cli_error(const gchar *error_msg, gpointer user_data)
@@ -645,13 +818,21 @@ static void on_cli_error(const gchar *error_msg, gpointer user_data)
     chat_webview_add_message(priv->webview, id, "error", error_msg, "", FALSE);
     g_hash_table_add(priv->known_msg_ids, id); /* hash table takes ownership */
 
+    chat_input_set_streaming(priv->input, FALSE);
     chat_input_set_busy(priv->input, FALSE);
 }
 
 static void on_cli_finished(gpointer user_data)
 {
     ChatWidgetPrivate *priv = user_data;
+    chat_input_set_streaming(priv->input, FALSE);
     chat_input_set_busy(priv->input, FALSE);
+}
+
+static void on_cli_streaming(gboolean active, gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+    chat_input_set_streaming(priv->input, active);
 }
 
 /* ── Input callbacks ─────────────────────────────────────────────── */
@@ -734,6 +915,7 @@ static void on_stop(gpointer user_data)
         cli_session_interrupt(priv->session);
     else
         cli_session_stop(priv->session);
+    chat_input_set_streaming(priv->input, FALSE);
     chat_input_set_busy(priv->input, FALSE);
 }
 
@@ -752,10 +934,20 @@ static void on_new_session(gpointer user_data)
     priv->mcp_servers_json = NULL;
     gtk_widget_hide(priv->mcp_indicator);
 
+    /* Reset usage tracker */
+    priv->total_input_tokens = 0;
+    priv->total_output_tokens = 0;
+    priv->total_cache_creation_tokens = 0;
+    priv->total_cache_read_tokens = 0;
+    priv->total_cost_usd = 0;
+    priv->estimated_cost_usd = 0;
+    update_usage_indicator(priv);
+
     /* Clear the web view */
     chat_webview_clear(priv->webview);
 
     /* Reset state */
+    chat_input_set_streaming(priv->input, FALSE);
     chat_input_set_busy(priv->input, FALSE);
     chat_input_clear(priv->input);
 
@@ -773,6 +965,8 @@ static void on_new_session(gpointer user_data)
     cli_session_set_mcp_status_callback(priv->session, on_cli_mcp_status, priv);
     cli_session_set_error_callback(priv->session, on_cli_error, priv);
     cli_session_set_finished_callback(priv->session, on_cli_finished, priv);
+    cli_session_set_streaming_callback(priv->session, on_cli_streaming, priv);
+    cli_session_set_usage_callback(priv->session, on_cli_usage, priv);
 }
 
 static void on_new_session_btn(GtkButton *btn, gpointer user_data)
@@ -856,17 +1050,128 @@ static void on_resume_session_btn(GtkButton *btn, gpointer user_data)
 
 /* ── Export conversation ─────────────────────────────────────────── */
 
+typedef enum {
+    EXPORT_COPY_MD,
+    EXPORT_SAVE_MD,
+    EXPORT_SAVE_HTML,
+    EXPORT_SAVE_JSON
+} ExportAction;
+
+/* Prompt the user for a save path, write `content` there. */
+static void save_export_to_file(ChatWidgetPrivate *priv,
+                                 const gchar *content,
+                                 const gchar *title,
+                                 const gchar *default_name)
+{
+    if (!content || !content[0]) {
+        msgwin_status_add("[geany-code] Nothing to export yet");
+        return;
+    }
+
+    GtkWidget *toplevel = gtk_widget_get_toplevel(priv->container);
+    GtkWindow *parent = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
+
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        title, parent,
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save",   GTK_RESPONSE_ACCEPT,
+        NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(
+        GTK_FILE_CHOOSER(dialog), TRUE);
+    gtk_file_chooser_set_current_name(
+        GTK_FILE_CHOOSER(dialog), default_name);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        gchar *path = gtk_file_chooser_get_filename(
+            GTK_FILE_CHOOSER(dialog));
+        GError *err = NULL;
+        if (g_file_set_contents(path, content, -1, &err)) {
+            msgwin_status_add("[geany-code] Exported to %s", path);
+        } else {
+            msgwin_status_add("[geany-code] Export failed: %s",
+                               err ? err->message : "unknown error");
+            if (err) g_error_free(err);
+        }
+        g_free(path);
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void do_export(ChatWidgetPrivate *priv, ExportAction action)
+{
+    switch (action) {
+    case EXPORT_COPY_MD: {
+        gchar *md = chat_webview_export_markdown(priv->webview);
+        if (md && md[0] != '\0') {
+            GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+            gtk_clipboard_set_text(clip, md, -1);
+            msgwin_status_add(
+                "[geany-code] Conversation copied to clipboard as Markdown");
+        } else {
+            msgwin_status_add("[geany-code] Nothing to export yet");
+        }
+        g_free(md);
+        break;
+    }
+    case EXPORT_SAVE_MD: {
+        gchar *md = chat_webview_export_markdown(priv->webview);
+        save_export_to_file(priv, md, "Save conversation as Markdown",
+                             "conversation.md");
+        g_free(md);
+        break;
+    }
+    case EXPORT_SAVE_HTML: {
+        gchar *html = chat_webview_export_html(priv->webview);
+        save_export_to_file(priv, html, "Save conversation as HTML",
+                             "conversation.html");
+        g_free(html);
+        break;
+    }
+    case EXPORT_SAVE_JSON: {
+        gchar *json = chat_webview_export_json(priv->webview);
+        save_export_to_file(priv, json, "Save conversation as JSON",
+                             "conversation.json");
+        g_free(json);
+        break;
+    }
+    }
+}
+
+static void on_export_menu_item(GtkMenuItem *item, gpointer user_data)
+{
+    ChatWidgetPrivate *priv = user_data;
+    ExportAction action = GPOINTER_TO_INT(
+        g_object_get_data(G_OBJECT(item), "export-action"));
+    do_export(priv, action);
+}
+
 static void on_export_clicked(GtkButton *btn, gpointer user_data)
 {
-    (void)btn;
     ChatWidgetPrivate *priv = user_data;
-    gchar *md = chat_webview_export_markdown(priv->webview);
-    if (md && md[0] != '\0') {
-        GtkClipboard *clip = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
-        gtk_clipboard_set_text(clip, md, -1);
-        msgwin_status_add("[geany-code] Conversation copied to clipboard as Markdown");
+
+    GtkWidget *menu = gtk_menu_new();
+    struct {
+        const gchar *label;
+        ExportAction action;
+    } items[] = {
+        { "Copy as Markdown",     EXPORT_COPY_MD   },
+        { "Save as Markdown…",    EXPORT_SAVE_MD   },
+        { "Save as HTML…",        EXPORT_SAVE_HTML },
+        { "Save as JSON…",        EXPORT_SAVE_JSON },
+    };
+    for (gsize i = 0; i < G_N_ELEMENTS(items); i++) {
+        GtkWidget *mi = gtk_menu_item_new_with_label(items[i].label);
+        g_object_set_data(G_OBJECT(mi), "export-action",
+                           GINT_TO_POINTER(items[i].action));
+        g_signal_connect(mi, "activate",
+                         G_CALLBACK(on_export_menu_item), priv);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
     }
-    g_free(md);
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_widget(GTK_MENU(menu), GTK_WIDGET(btn),
+                              GDK_GRAVITY_SOUTH_WEST,
+                              GDK_GRAVITY_NORTH_WEST, NULL);
 }
 
 /* ── Jump-to-edit callback from web view ─────────────────────────── */
@@ -901,8 +1206,516 @@ static void on_destroy(GtkWidget *widget, gpointer data)
         g_hash_table_unref(priv->known_msg_ids);
         g_hash_table_unref(priv->edit_stats);
         g_free(priv->mcp_servers_json);
+        g_free(priv->last_model);
         g_free(priv);
     }
+}
+
+/* ── Command palette ─────────────────────────────────────────────── */
+
+typedef enum {
+    PALETTE_ACTION_FOCUS_INPUT,
+    PALETTE_ACTION_NEW_SESSION,
+    PALETTE_ACTION_RESUME_SESSION,
+    PALETTE_ACTION_STOP,
+    PALETTE_ACTION_ADD_CONTEXT,
+    PALETTE_ACTION_EXPLAIN,
+    PALETTE_ACTION_FIND_BUGS,
+    PALETTE_ACTION_IMPROVE,
+    PALETTE_ACTION_SEND_SELECTION,
+    PALETTE_ACTION_MANAGE_HOOKS,
+    PALETTE_ACTION_EXPORT_COPY_MD,
+    PALETTE_ACTION_EXPORT_SAVE_MD,
+    PALETTE_ACTION_EXPORT_SAVE_HTML,
+    PALETTE_ACTION_EXPORT_SAVE_JSON,
+    PALETTE_ACTION_SLASH_COMMAND  /* payload = command name */
+} PaletteActionKind;
+
+typedef struct {
+    PaletteActionKind kind;
+    gchar *label;
+    gchar *subtitle;
+    gchar *category;
+    gchar *payload;   /* for slash commands: the command name */
+    /* Lowercased haystack for fuzzy matching. */
+    gchar *search_key;
+} PaletteEntry;
+
+typedef struct {
+    ChatWidgetPrivate *priv;
+    GtkWidget *window;
+    GtkWidget *search_entry;
+    GtkWidget *listbox;
+    GPtrArray *entries;  /* owns PaletteEntry* */
+} PaletteState;
+
+static void palette_entry_free(gpointer data)
+{
+    PaletteEntry *e = data;
+    if (!e) return;
+    g_free(e->label);
+    g_free(e->subtitle);
+    g_free(e->category);
+    g_free(e->payload);
+    g_free(e->search_key);
+    g_free(e);
+}
+
+static void palette_add(GPtrArray *entries, PaletteActionKind kind,
+                         const gchar *category,
+                         const gchar *label, const gchar *subtitle,
+                         const gchar *payload)
+{
+    PaletteEntry *e = g_new0(PaletteEntry, 1);
+    e->kind = kind;
+    e->label = g_strdup(label ? label : "");
+    e->subtitle = g_strdup(subtitle ? subtitle : "");
+    e->category = g_strdup(category ? category : "");
+    e->payload = g_strdup(payload ? payload : "");
+
+    /* Build a combined, lowercased haystack for matching. */
+    GString *hay = g_string_new(NULL);
+    g_string_append(hay, e->label);
+    g_string_append_c(hay, ' ');
+    g_string_append(hay, e->subtitle);
+    g_string_append_c(hay, ' ');
+    g_string_append(hay, e->category);
+    g_string_append_c(hay, ' ');
+    g_string_append(hay, e->payload);
+    e->search_key = g_utf8_strdown(hay->str, -1);
+    g_string_free(hay, TRUE);
+
+    g_ptr_array_add(entries, e);
+}
+
+/* Subsequence match: every char in needle appears in haystack in order.
+ * Returns a simple score (lower is better): position of first needle
+ * char + span it took. Returns -1 if no match. */
+static gint palette_score(const gchar *haystack_lower,
+                           const gchar *needle_lower)
+{
+    if (!needle_lower || !*needle_lower)
+        return 0;
+
+    const gchar *h = haystack_lower;
+    const gchar *n = needle_lower;
+    gint first = -1;
+    gint last = -1;
+    gint pos = 0;
+
+    while (*h && *n) {
+        if (*h == *n) {
+            if (first < 0) first = pos;
+            last = pos;
+            n++;
+        }
+        h++;
+        pos++;
+    }
+    if (*n)
+        return -1;  /* ran out of haystack before consuming needle */
+
+    gint span = last - first;
+    return first * 2 + span;  /* weight earlier matches + tighter runs */
+}
+
+static void palette_on_collect_command(const gchar *name,
+                                        const gchar *description,
+                                        gpointer data)
+{
+    GPtrArray *entries = data;
+    gchar *label = g_strdup_printf("/%s", name);
+    palette_add(entries, PALETTE_ACTION_SLASH_COMMAND,
+                 "Slash command", label,
+                 description && *description ? description : "",
+                 name);
+    g_free(label);
+}
+
+static GPtrArray *palette_build_entries(ChatWidgetPrivate *priv)
+{
+    GPtrArray *entries = g_ptr_array_new_with_free_func(palette_entry_free);
+
+    palette_add(entries, PALETTE_ACTION_FOCUS_INPUT, "Chat",
+                 "Focus Input", "Jump to the chat input field", NULL);
+    palette_add(entries, PALETTE_ACTION_NEW_SESSION, "Chat",
+                 "New Session", "Start a fresh conversation", NULL);
+    palette_add(entries, PALETTE_ACTION_RESUME_SESSION, "Chat",
+                 "Resume Session…", "Open the session picker", NULL);
+    palette_add(entries, PALETTE_ACTION_STOP, "Chat",
+                 "Stop / Interrupt", "Interrupt the current response", NULL);
+
+    palette_add(entries, PALETTE_ACTION_ADD_CONTEXT, "Selection",
+                 "Add Selection to Context",
+                 "Attach the editor selection as a context chunk", NULL);
+    palette_add(entries, PALETTE_ACTION_SEND_SELECTION, "Selection",
+                 "Send Selection to Claude",
+                 "Send the editor selection as a new prompt", NULL);
+    palette_add(entries, PALETTE_ACTION_EXPLAIN, "Selection",
+                 "Explain Selection", "Ask Claude to explain this code", NULL);
+    palette_add(entries, PALETTE_ACTION_FIND_BUGS, "Selection",
+                 "Find Bugs in Selection",
+                 "Ask Claude to review for bugs", NULL);
+    palette_add(entries, PALETTE_ACTION_IMPROVE, "Selection",
+                 "Suggest Improvements",
+                 "Ask Claude to suggest refactors", NULL);
+
+    palette_add(entries, PALETTE_ACTION_EXPORT_COPY_MD, "Export",
+                 "Copy conversation as Markdown", NULL, NULL);
+    palette_add(entries, PALETTE_ACTION_EXPORT_SAVE_MD, "Export",
+                 "Save conversation as Markdown…", NULL, NULL);
+    palette_add(entries, PALETTE_ACTION_EXPORT_SAVE_HTML, "Export",
+                 "Save conversation as HTML…",
+                 "Standalone styled document", NULL);
+    palette_add(entries, PALETTE_ACTION_EXPORT_SAVE_JSON, "Export",
+                 "Save conversation as JSON…",
+                 "Structured log of messages and tools", NULL);
+
+    palette_add(entries, PALETTE_ACTION_MANAGE_HOOKS, "Plugin",
+                 "Manage Hooks…",
+                 "Open the agent-hooks dialog", NULL);
+
+    /* Slash commands reported by the CLI. */
+    chat_input_foreach_command(priv->input, palette_on_collect_command,
+                                entries);
+
+    return entries;
+}
+
+static void palette_execute(PaletteState *st, PaletteEntry *e)
+{
+    ChatWidgetPrivate *priv = st->priv;
+    GtkWidget *chat_widget = priv->container;
+
+    switch (e->kind) {
+    case PALETTE_ACTION_FOCUS_INPUT:
+        chat_widget_focus_input(chat_widget);
+        break;
+    case PALETTE_ACTION_NEW_SESSION:
+        on_new_session(priv);
+        break;
+    case PALETTE_ACTION_RESUME_SESSION:
+        on_resume_session_btn(NULL, priv);
+        break;
+    case PALETTE_ACTION_STOP:
+        on_stop(priv);
+        break;
+    case PALETTE_ACTION_ADD_CONTEXT:
+        chat_widget_add_context_from_editor(chat_widget);
+        break;
+    case PALETTE_ACTION_EXPLAIN:
+    case PALETTE_ACTION_FIND_BUGS:
+    case PALETTE_ACTION_IMPROVE: {
+        GeanyDocument *doc = document_get_current();
+        if (doc && doc->is_valid) {
+            const gchar *prompt =
+                (e->kind == PALETTE_ACTION_EXPLAIN)
+                    ? "Explain this code"
+                : (e->kind == PALETTE_ACTION_FIND_BUGS)
+                    ? "Find bugs in this code"
+                    : "Suggest improvements for this code";
+            chat_widget_quick_action(chat_widget, doc, prompt);
+        }
+        break;
+    }
+    case PALETTE_ACTION_SEND_SELECTION: {
+        GeanyDocument *doc = document_get_current();
+        if (doc && doc->is_valid)
+            chat_widget_send_selection(chat_widget, doc);
+        break;
+    }
+    case PALETTE_ACTION_MANAGE_HOOKS:
+        hooks_dialog_run(GTK_WINDOW(geany->main_widgets->window));
+        break;
+    case PALETTE_ACTION_EXPORT_COPY_MD:
+        do_export(priv, EXPORT_COPY_MD); break;
+    case PALETTE_ACTION_EXPORT_SAVE_MD:
+        do_export(priv, EXPORT_SAVE_MD); break;
+    case PALETTE_ACTION_EXPORT_SAVE_HTML:
+        do_export(priv, EXPORT_SAVE_HTML); break;
+    case PALETTE_ACTION_EXPORT_SAVE_JSON:
+        do_export(priv, EXPORT_SAVE_JSON); break;
+    case PALETTE_ACTION_SLASH_COMMAND:
+        if (e->payload && *e->payload) {
+            ensure_session(priv);
+            gchar *cmd = g_strdup_printf("/%s", e->payload);
+            /* Render the command in the chat like a regular user message
+             * so the session transcript has a record of it. */
+            gchar *id = g_strdup_printf("user_%u", priv->msg_counter++);
+            GDateTime *now = g_date_time_new_now_local();
+            gchar *ts = g_date_time_format_iso8601(now);
+            chat_webview_add_message(priv->webview, id, "user",
+                                      cmd, ts, FALSE);
+            g_free(ts);
+            g_date_time_unref(now);
+            g_free(id);
+            /* Send the raw slash command so the CLI intercepts it rather
+             * than forwarding to the model. No context chunks / images. */
+            cli_session_send_message(priv->session, cmd, NULL, NULL, NULL);
+            chat_input_set_busy(priv->input, TRUE);
+            g_free(cmd);
+        }
+        break;
+    }
+}
+
+static GtkWidget *palette_build_row(PaletteEntry *e)
+{
+    GtkWidget *row = gtk_list_box_row_new();
+    g_object_set_data(G_OBJECT(row), "palette-entry", e);
+
+    GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_set_margin_start(hbox, 8);
+    gtk_widget_set_margin_end(hbox, 8);
+    gtk_widget_set_margin_top(hbox, 4);
+    gtk_widget_set_margin_bottom(hbox, 4);
+
+    GtkWidget *text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+    gtk_widget_set_hexpand(text_box, TRUE);
+
+    GtkWidget *title = gtk_label_new(NULL);
+    gchar *title_markup = g_markup_printf_escaped(
+        "<b>%s</b>", e->label);
+    gtk_label_set_markup(GTK_LABEL(title), title_markup);
+    g_free(title_markup);
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    gtk_box_pack_start(GTK_BOX(text_box), title, FALSE, FALSE, 0);
+
+    if (e->subtitle && *e->subtitle) {
+        GtkWidget *sub = gtk_label_new(e->subtitle);
+        gtk_label_set_xalign(GTK_LABEL(sub), 0.0);
+        gtk_label_set_ellipsize(GTK_LABEL(sub), PANGO_ELLIPSIZE_END);
+        gchar *sub_markup = g_markup_printf_escaped(
+            "<span size=\"small\" alpha=\"65%%\">%s</span>", e->subtitle);
+        gtk_label_set_markup(GTK_LABEL(sub), sub_markup);
+        g_free(sub_markup);
+        gtk_box_pack_start(GTK_BOX(text_box), sub, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(hbox), text_box, TRUE, TRUE, 0);
+
+    if (e->category && *e->category) {
+        GtkWidget *cat = gtk_label_new(NULL);
+        gchar *cat_markup = g_markup_printf_escaped(
+            "<span size=\"small\" alpha=\"50%%\">%s</span>", e->category);
+        gtk_label_set_markup(GTK_LABEL(cat), cat_markup);
+        gtk_widget_set_valign(cat, GTK_ALIGN_CENTER);
+        gtk_box_pack_end(GTK_BOX(hbox), cat, FALSE, FALSE, 0);
+        g_free(cat_markup);
+    }
+
+    gtk_container_add(GTK_CONTAINER(row), hbox);
+    return row;
+}
+
+/* Scored entry used during filtering. */
+typedef struct {
+    PaletteEntry *entry;
+    gint score;
+} PaletteHit;
+
+static gint palette_hit_cmp(gconstpointer a, gconstpointer b)
+{
+    const PaletteHit *ha = a;
+    const PaletteHit *hb = b;
+    if (ha->score != hb->score) return ha->score - hb->score;
+    return g_strcmp0(ha->entry->label, hb->entry->label);
+}
+
+static void palette_refresh(PaletteState *st)
+{
+    /* Clear current rows. */
+    GList *rows = gtk_container_get_children(GTK_CONTAINER(st->listbox));
+    for (GList *r = rows; r; r = r->next)
+        gtk_widget_destroy(GTK_WIDGET(r->data));
+    g_list_free(rows);
+
+    const gchar *query = gtk_entry_get_text(GTK_ENTRY(st->search_entry));
+    gchar *needle = query ? g_utf8_strdown(query, -1) : g_strdup("");
+
+    GArray *hits = g_array_new(FALSE, FALSE, sizeof(PaletteHit));
+    for (guint i = 0; i < st->entries->len; i++) {
+        PaletteEntry *e = g_ptr_array_index(st->entries, i);
+        gint s = palette_score(e->search_key, needle);
+        if (s < 0) continue;
+        PaletteHit h = { e, s };
+        g_array_append_val(hits, h);
+    }
+    g_array_sort(hits, palette_hit_cmp);
+
+    const guint MAX_SHOW = 80;
+    guint shown = MIN(hits->len, MAX_SHOW);
+    for (guint i = 0; i < shown; i++) {
+        PaletteHit *h = &g_array_index(hits, PaletteHit, i);
+        GtkWidget *row = palette_build_row(h->entry);
+        gtk_list_box_insert(GTK_LIST_BOX(st->listbox), row, -1);
+    }
+    gtk_widget_show_all(st->listbox);
+
+    /* Auto-select first row so Enter does the obvious thing. */
+    GtkListBoxRow *first = gtk_list_box_get_row_at_index(
+        GTK_LIST_BOX(st->listbox), 0);
+    if (first)
+        gtk_list_box_select_row(GTK_LIST_BOX(st->listbox), first);
+
+    g_array_free(hits, TRUE);
+    g_free(needle);
+}
+
+static void palette_activate_selected(PaletteState *st)
+{
+    GtkListBoxRow *row = gtk_list_box_get_selected_row(
+        GTK_LIST_BOX(st->listbox));
+    if (!row) return;
+    PaletteEntry *e = g_object_get_data(G_OBJECT(row), "palette-entry");
+    if (!e) return;
+
+    /* Hide before dispatch so the palette gets out of the user's way, but
+     * don't destroy yet — destroy frees the entries array, which would
+     * invalidate `e` before palette_execute reads it. */
+    gtk_widget_hide(st->window);
+    palette_execute(st, e);
+    gtk_widget_destroy(st->window);
+}
+
+static void on_palette_entry_changed(GtkEditable *ed, gpointer data)
+{
+    (void)ed;
+    palette_refresh((PaletteState *)data);
+}
+
+static void on_palette_entry_activate(GtkEntry *entry, gpointer data)
+{
+    (void)entry;
+    palette_activate_selected((PaletteState *)data);
+}
+
+static void on_palette_row_activated(GtkListBox *box, GtkListBoxRow *row,
+                                      gpointer data)
+{
+    (void)box; (void)row;
+    palette_activate_selected((PaletteState *)data);
+}
+
+static gboolean on_palette_key_press(GtkWidget *widget, GdkEventKey *event,
+                                      gpointer data)
+{
+    (void)widget;
+    PaletteState *st = data;
+
+    if (event->keyval == GDK_KEY_Escape) {
+        gtk_widget_destroy(st->window);
+        return TRUE;
+    }
+
+    GtkListBox *lb = GTK_LIST_BOX(st->listbox);
+
+    if (event->keyval == GDK_KEY_Down ||
+        event->keyval == GDK_KEY_Up ||
+        event->keyval == GDK_KEY_Page_Down ||
+        event->keyval == GDK_KEY_Page_Up)
+    {
+        GtkListBoxRow *cur = gtk_list_box_get_selected_row(lb);
+        gint idx = cur ? gtk_list_box_row_get_index(cur) : -1;
+        gint step = (event->keyval == GDK_KEY_Down) ? 1
+                  : (event->keyval == GDK_KEY_Up)   ? -1
+                  : (event->keyval == GDK_KEY_Page_Down) ? 8
+                  : -8;
+        gint next = idx + step;
+        if (next < 0) next = 0;
+        GtkListBoxRow *target = gtk_list_box_get_row_at_index(lb, next);
+        if (!target) {
+            /* Snap to last row. */
+            gint i = 0;
+            while (gtk_list_box_get_row_at_index(lb, i)) i++;
+            target = gtk_list_box_get_row_at_index(lb, i - 1);
+        }
+        if (target) {
+            gtk_list_box_select_row(lb, target);
+            gtk_widget_grab_focus(GTK_WIDGET(target));
+            /* Give focus back to entry so typing continues to filter. */
+            gtk_widget_grab_focus(st->search_entry);
+            gtk_list_box_select_row(lb, target);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void on_palette_destroy(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    PaletteState *st = data;
+    g_ptr_array_free(st->entries, TRUE);
+    g_free(st);
+}
+
+gboolean chat_widget_copy_last_response(GtkWidget *widget)
+{
+    ChatWidgetPrivate *priv = get_priv(widget);
+    if (!priv) return FALSE;
+    return chat_webview_copy_last_response(priv->webview);
+}
+
+void chat_widget_show_command_palette(GtkWidget *widget)
+{
+    ChatWidgetPrivate *priv = get_priv(widget);
+    if (!priv) return;
+
+    PaletteState *st = g_new0(PaletteState, 1);
+    st->priv = priv;
+    st->entries = palette_build_entries(priv);
+
+    GtkWidget *toplevel = gtk_widget_get_toplevel(priv->container);
+    GtkWindow *parent = GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL;
+
+    st->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(st->window), "Command Palette");
+    gtk_window_set_modal(GTK_WINDOW(st->window), TRUE);
+    gtk_window_set_transient_for(GTK_WINDOW(st->window), parent);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(st->window), TRUE);
+    gtk_window_set_position(GTK_WINDOW(st->window),
+                             GTK_WIN_POS_CENTER_ON_PARENT);
+    gtk_window_set_default_size(GTK_WINDOW(st->window), 560, 420);
+    gtk_container_set_border_width(GTK_CONTAINER(st->window), 6);
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+
+    st->search_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(st->search_entry),
+        "Type to search commands, actions, or /slash commands…");
+    gtk_entry_set_icon_from_icon_name(GTK_ENTRY(st->search_entry),
+        GTK_ENTRY_ICON_PRIMARY, "system-search-symbolic");
+    gtk_box_pack_start(GTK_BOX(vbox), st->search_entry, FALSE, FALSE, 0);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+
+    st->listbox = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(st->listbox),
+                                     GTK_SELECTION_BROWSE);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(st->listbox), TRUE);
+    gtk_container_add(GTK_CONTAINER(scroll), st->listbox);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+
+    gtk_container_add(GTK_CONTAINER(st->window), vbox);
+
+    g_signal_connect(st->search_entry, "changed",
+                     G_CALLBACK(on_palette_entry_changed), st);
+    g_signal_connect(st->search_entry, "activate",
+                     G_CALLBACK(on_palette_entry_activate), st);
+    g_signal_connect(st->listbox, "row-activated",
+                     G_CALLBACK(on_palette_row_activated), st);
+    g_signal_connect(st->window, "key-press-event",
+                     G_CALLBACK(on_palette_key_press), st);
+    g_signal_connect(st->window, "destroy",
+                     G_CALLBACK(on_palette_destroy), st);
+
+    palette_refresh(st);
+
+    gtk_widget_show_all(st->window);
+    gtk_widget_grab_focus(st->search_entry);
 }
 
 /* ── Construction ────────────────────────────────────────────────── */
@@ -926,7 +1739,7 @@ GtkWidget *chat_widget_new(void)
     gtk_widget_set_margin_top(header, 4);
     gtk_widget_set_margin_bottom(header, 4);
 
-    GtkWidget *title = gtk_label_new("Claude Code");
+    GtkWidget *title = gtk_label_new("Geany Code");
     PangoAttrList *attrs = pango_attr_list_new();
     pango_attr_list_insert(attrs, pango_attr_weight_new(PANGO_WEIGHT_BOLD));
     gtk_label_set_attributes(GTK_LABEL(title), attrs);
@@ -953,11 +1766,20 @@ GtkWidget *chat_widget_new(void)
     g_signal_connect(priv->mcp_indicator, "clicked",
                      G_CALLBACK(on_mcp_indicator_clicked), priv);
 
-    /* Export conversation button (icon) */
+    /* Cumulative token usage indicator (hidden until first result) */
+    priv->usage_indicator = gtk_button_new_with_label("");
+    gtk_button_set_relief(GTK_BUTTON(priv->usage_indicator), GTK_RELIEF_NONE);
+    gtk_widget_set_no_show_all(priv->usage_indicator, TRUE);
+    gtk_widget_set_focus_on_click(priv->usage_indicator, FALSE);
+    /* Label-only; clicking does nothing. */
+    gtk_box_pack_start(GTK_BOX(header), priv->usage_indicator, FALSE, FALSE, 0);
+
+    /* Export conversation button (icon) — opens a menu of export formats */
     GtkWidget *export_btn = gtk_button_new_from_icon_name(
-        "edit-copy-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
+        "document-save-symbolic", GTK_ICON_SIZE_SMALL_TOOLBAR);
     gtk_button_set_relief(GTK_BUTTON(export_btn), GTK_RELIEF_NONE);
-    gtk_widget_set_tooltip_text(export_btn, "Copy conversation as Markdown");
+    gtk_widget_set_tooltip_text(export_btn,
+        "Export conversation (Markdown / HTML / JSON)");
     gtk_box_pack_start(GTK_BOX(header), export_btn, FALSE, FALSE, 0);
 
     /* Resume session button (icon) */
@@ -1013,6 +1835,8 @@ GtkWidget *chat_widget_new(void)
     cli_session_set_mcp_status_callback(priv->session, on_cli_mcp_status, priv);
     cli_session_set_error_callback(priv->session, on_cli_error, priv);
     cli_session_set_finished_callback(priv->session, on_cli_finished, priv);
+    cli_session_set_streaming_callback(priv->session, on_cli_streaming, priv);
+    cli_session_set_usage_callback(priv->session, on_cli_usage, priv);
 
     /* Wire up input */
     chat_input_set_send_callback(priv->input, on_send, priv);
@@ -1079,21 +1903,14 @@ void chat_widget_paste_image(GtkWidget *widget)
 
     GtkClipboard *cb = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     GdkPixbuf *pixbuf = gtk_clipboard_wait_for_image(cb);
-    msgwin_status_add("[geany-code] paste_image: pixbuf=%p", (void *)pixbuf);
     if (!pixbuf) return;
-
-    msgwin_status_add("[geany-code] paste_image: %dx%d",
-        gdk_pixbuf_get_width(pixbuf), gdk_pixbuf_get_height(pixbuf));
 
     gchar *png_data = NULL;
     gsize png_len = 0;
     if (gdk_pixbuf_save_to_buffer(pixbuf, &png_data, &png_len, "png", NULL, NULL)) {
         gchar *b64 = g_base64_encode((guchar *)png_data, png_len);
         g_free(png_data);
-        msgwin_status_add("[geany-code] paste_image: b64 len=%lu, input=%p",
-            (unsigned long)strlen(b64), (void *)priv->input);
         chat_input_add_image(priv->input, pixbuf, b64);
-        msgwin_status_add("[geany-code] paste_image: chip added");
     }
 
     g_object_unref(pixbuf);

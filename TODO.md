@@ -72,3 +72,120 @@
 ### Hard
 - [x] **Edit tracking** — header indicator (N files, +added, -removed) with
   popover listing edited files, per-file stats, jump-to-file links
+
+---
+
+## Bug Fixes
+
+Ranked roughly by impact ÷ effort.
+
+### Trivial
+- [x] **Fragile tool-name matching for edit tracking** — replaced `strstr`
+  with exact-name allowlists (`EDIT_TOOLS` / `WRITE_TOOLS`) in
+  `chat_widget.c`.
+- [x] **NULL deref on empty chat export** — already guarded at
+  `chat_widget.c:893` (`if (md && md[0] != '\0')`). No change needed.
+- [x] **Unvalidated `suggestion_N` index** — replaced `atoi` with `strtol`
+  + endptr/range validation in `cli_session.c`.
+- [x] **Scan-done missing priv null-check in all branches** — verified both
+  early-return paths in `scan_done` already handle `priv == NULL`.
+
+### Small
+- [x] **Silent stdin write failures** — prompt-send path was already wired to
+  `error_cb`. Verified; no change.
+- [x] **Streaming-finish double dispatch** — added `finished_dispatched`
+  flag; EOF and read-error paths now also reset streaming / dispatch finish
+  exactly once. Reset on new session start.
+- [x] **D-Bus question timeout vs. response race** — on inspection the
+  nested main loop is single-threaded and hash-table removal prevents UAF; no
+  real race. No change.
+- [x] **`@` file menu silently caps at 20 matches** — now appends an inert
+  "… and N more" item when total matches exceed the cap.
+- [x] **MCP status callback missing null-check on `mcp_servers`** — now
+  validates the node is an array and checks the generated JSON is non-NULL
+  before invoking the callback.
+
+### Medium
+- [x] **MCP D-Bus proxy never retries** — MCP server startup no longer fails
+  hard if Geany D-Bus isn't ready; `call_dbus` lazy-connects on first use and
+  reconnects on transport errors (`NO_REPLY`, `DISCONNECTED`,
+  `SERVICE_UNKNOWN`, `NAME_HAS_NO_OWNER`).
+- [x] **`reload_if_stale` only checks `st_size`** — now tracks an
+  `(mtime, size)` fingerprint per file in a hash table; reloads when either
+  changes, catching same-length disk edits.
+- [x] **No key-repeat debounce in slash/file menu** — `on_buffer_changed`
+  now coalesces into a 30 ms `g_timeout_add` that rebuilds the menu only
+  once typing pauses.
+
+---
+
+## Features & UX Improvements
+
+Ranked loosely by value ÷ effort.
+
+### Quick wins (trivial / small)
+- [ ] **Stop-reason badge** — Show `end_turn` / `max_tokens` / `stop_sequence`
+  after each response. Helps users notice truncated outputs.
+- [ ] **Recent-files quick panel** — `Ctrl+R` in chat pops Geany's
+  recent-files list; click to jump or add as context.
+- [x] **Usage tracker** — header indicator shows cumulative
+  `↑input ↓output $cost` across the session, with a `~` prefix when we
+  had to estimate cost from per-model rates. Tooltip breaks down input /
+  output / cache-write / cache-read tokens and model. Resets on New
+  Session.
+- [x] **Right-click "Add to chat" / "Explain"** — appended a Claude section
+  (Add to Context, Send Selection, Explain, Find Bugs, Suggest Improvements)
+  to Geany's editor context menu. `update-editor-menu` handler greys them
+  out when no selection.
+- [x] **Input drafts + per-project prompt history** —
+  `~/.config/geany/plugins/geany-code/history/<project-slug>.json` now
+  persists: (a) the current unsent draft (debounced save while typing,
+  restored on next open if the buffer is empty), and (b) the last 200
+  sent prompts (deduplicated against the most-recent entry). Bare Up /
+  Down in the input browse history when the cursor is on the first /
+  last line — otherwise Up/Down move the cursor normally. Past the
+  newest entry, Down restores whatever was typed before browsing began.
+- [ ] **Context meter** — Show approx. token count for currently attached
+  context chunks + selection + images before sending; warn near limit.
+- [x] **Export-conversation variants** — export button now opens a menu
+  with: Copy as Markdown (previous default), Save as Markdown…, Save as
+  HTML… (styled, standalone, dark/light aware), Save as JSON… (structured
+  entry list).
+
+### Medium
+- [ ] **Keybinding panel** — Let users rebind send / focus-input / new-session
+  / add-context / paste-image via a settings dialog (`GKeyFile`).
+- [x] **AI command palette** — `Ctrl+Shift+P` opens a modal search window
+  listing chat actions (Focus Input, New/Resume Session, Stop), selection
+  quick-actions (Add Context, Send, Explain, Find Bugs, Improve), export
+  variants (Copy/Save MD/HTML/JSON), Manage Hooks, and all CLI-reported
+  `/slash` commands. Fuzzy subsequence match with score sort;
+  up/down/page-up/page-down nav, Enter to run, Esc to cancel.
+- [ ] **Session metadata popover** — Click session name → creation time,
+  message count, tokens, models used, files edited. Optional CSV export of all
+  sessions.
+- [x] **Inline accept/reject for diffs** — when a permission prompt
+  arrives for an edit/write-family tool and a diff block has just been
+  rendered for it, Accept / Reject / suggestion buttons are appended
+  directly under the diff (green/red outline, small) instead of a
+  separate permission card. Clicking collapses the row to a muted
+  `✓ Accepted` / `✗ Rejected` / `✓ Accepted for session` status so the
+  diff stays visible. Non-edit tools keep the existing card.
+- [ ] **Sidebar project file tree** — Panel of open/recent files with hover
+  preview; click opens in editor.
+- [ ] **Re-run bash result** — Add a "Run again" action on `Bash` tool
+  results; keeps the last N command variants for quick iteration.
+- [x] **Copy single response as Markdown** — hover-reveal copy icon in
+  the top-right of each assistant message copies that message's raw
+  content to the clipboard. `Ctrl+Shift+Y` from anywhere copies the
+  most-recent assistant response; status bar confirms the action.
+
+### Large
+- [ ] **Conversation branching** — Fork a session from any message; preserve
+  branches in session files and in the session picker.
+- [ ] **Resume-from-interrupt** — When the user hits Stop mid-stream, keep the
+  partial response and offer a "Continue" button that picks up where it
+  stopped.
+- [ ] **Edit-preview approval flow** — Intercept the `edit` tool, render a
+  side-by-side preview, and require explicit approval before applying
+  (distinct from `acceptEdits` mode).

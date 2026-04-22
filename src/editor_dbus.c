@@ -4,8 +4,11 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/* Reload document from disk only if the file on disk differs
- * from the buffer (by size). Avoids marking all lines as changed. */
+/* Reload document from disk only if the file on disk differs from the
+ * editor buffer. Compares byte size first (cheap) and then falls back
+ * to checking mtime against the previously-observed value so that
+ * same-length edits (UTF-8 re-encoding, line-ending changes) still
+ * trigger a reload without discarding in-buffer unsaved edits. */
 static void reload_if_stale(GeanyDocument *doc)
 {
     if (!doc || !doc->is_valid || !doc->file_name)
@@ -16,13 +19,37 @@ static void reload_if_stale(GeanyDocument *doc)
         return;  /* file doesn't exist on disk yet */
 
     gint buf_len = sci_get_length(doc->editor->sci);
-    if ((gint)st.st_size != buf_len)
+
+    gboolean size_mismatch = ((gint)st.st_size != buf_len);
+    gboolean mtime_changed = FALSE;
+
+    /* Track last-observed mtime on the ScintillaObject (a GObject) so it
+     * ties to document lifetime and needs no globals. */
+    ScintillaObject *sci_obj = doc->editor->sci;
+    time_t *last_mtime = g_object_get_data(
+        G_OBJECT(sci_obj), "geanycode-last-mtime");
+    if (last_mtime && *last_mtime != st.st_mtime)
+        mtime_changed = TRUE;
+
+    if (size_mismatch || mtime_changed)
         document_reload_force(doc, NULL);
+
+    /* Record mtime after any reload so next call compares against the
+     * current on-disk state. */
+    struct stat st2;
+    if (stat(doc->file_name, &st2) == 0) {
+        time_t *nm = g_new(time_t, 1);
+        *nm = st2.st_mtime;
+        g_object_set_data_full(G_OBJECT(sci_obj), "geanycode-last-mtime",
+                                nm, g_free);
+    }
 }
 
 static GDBusConnection *connection = NULL;
 static guint registration_id = 0;
 static guint owner_id = 0;
+static gchar *dbus_bus_name = NULL;
+static gchar *dbus_object_path = NULL;
 
 /* Pending question state */
 typedef struct {
@@ -208,16 +235,25 @@ static void handle_method_call(GDBusConnection       *conn,
         /* Use Scintilla's own search to find the exact match position.
          * This handles UTF-8 correctly and gives us Scintilla positions. */
         gint doc_len = sci_get_length(sci);
-        sci_set_target_start(sci, 0);
-        sci_set_target_end(sci, doc_len);
+        gint old_len = (gint)strlen(old_text);
 
-        /* sci_find_text with struct */
-        struct Sci_TextToFind ttf;
+        /* First search: find the match and capture its range. */
+        struct Sci_TextToFind ttf = {0};
         ttf.chrg.cpMin = 0;
         ttf.chrg.cpMax = doc_len;
         ttf.lpstrText = (gchar *)old_text;
 
-        gint found = scintilla_send_message(sci, SCI_FINDTEXT,
+        /* Reject empty search strings — SCI_FINDTEXT matches an empty
+         * needle at every position and we'd incorrectly flag it as
+         * ambiguous or replace at position 0. */
+        if (old_len == 0) {
+            g_dbus_method_invocation_return_dbus_error(
+                invocation, "org.geanycode.Error.InvalidArgs",
+                "old_text must be a non-empty string");
+            return;
+        }
+
+        gint found = (gint)scintilla_send_message(sci, SCI_FINDTEXT,
             SCFIND_MATCHCASE, (sptr_t)&ttf);
 
         if (found < 0) {
@@ -228,16 +264,31 @@ static void handle_method_call(GDBusConnection       *conn,
         }
 
         gint start_pos = ttf.chrgText.cpMin;
-        gint end_pos = ttf.chrgText.cpMax;
+        gint end_pos   = ttf.chrgText.cpMax;
 
-        /* Check uniqueness — search again from after the match */
-        struct Sci_TextToFind ttf2;
-        ttf2.chrg.cpMin = end_pos;
-        ttf2.chrg.cpMax = doc_len;
-        ttf2.lpstrText = (gchar *)old_text;
+        /* Guard against a stale/garbage chrgText output: if the reported
+         * end position is <= start, derive it from the start position
+         * plus the byte length of the search string. */
+        if (end_pos <= start_pos)
+            end_pos = start_pos + old_len;
 
-        if (scintilla_send_message(sci, SCI_FINDTEXT,
-                SCFIND_MATCHCASE, (sptr_t)&ttf2) >= 0) {
+        /* Uniqueness check: only run if there's at least enough room left
+         * in the document for another full match of the old text. This
+         * avoids degenerate empty/short-range Scintilla searches that
+         * have historically returned spurious hits. */
+        gboolean has_more = FALSE;
+        if (end_pos + old_len <= doc_len) {
+            struct Sci_TextToFind ttf2 = {0};
+            ttf2.chrg.cpMin = end_pos;
+            ttf2.chrg.cpMax = doc_len;
+            ttf2.lpstrText = (gchar *)old_text;
+
+            gint second = (gint)scintilla_send_message(sci, SCI_FINDTEXT,
+                SCFIND_MATCHCASE, (sptr_t)&ttf2);
+            has_more = (second >= 0 && second >= end_pos);
+        }
+
+        if (has_more) {
             g_dbus_method_invocation_return_dbus_error(
                 invocation, "org.geanycode.Error.Ambiguous",
                 "old_text appears multiple times in document");
@@ -702,7 +753,7 @@ static void on_bus_acquired(GDBusConnection *conn, const gchar *name,
     GError *error = NULL;
     registration_id = g_dbus_connection_register_object(
         conn,
-        "/GeanyCode/Editor",
+        dbus_object_path,
         introspection_data->interfaces[0],
         &interface_vtable,
         NULL, NULL, &error);
@@ -737,8 +788,11 @@ void editor_dbus_start(void)
     introspection_data = g_dbus_node_info_new_for_xml(introspection_xml, NULL);
     g_assert(introspection_data != NULL);
 
+    dbus_bus_name = g_strdup_printf("org.geanycode.editor.i%u", (guint)getpid());
+    dbus_object_path = g_strdup_printf("/GeanyCode/Editor/i%u", (guint)getpid());
+
     owner_id = g_bus_own_name(G_BUS_TYPE_SESSION,
-                              "org.geanycode.editor",
+                              dbus_bus_name,
                               G_BUS_NAME_OWNER_FLAGS_NONE,
                               on_bus_acquired,
                               on_name_acquired,
@@ -767,6 +821,11 @@ void editor_dbus_stop(void)
         g_hash_table_unref(pending_questions);
         pending_questions = NULL;
     }
+
+    g_free(dbus_bus_name);
+    dbus_bus_name = NULL;
+    g_free(dbus_object_path);
+    dbus_object_path = NULL;
 }
 
 void editor_dbus_set_question_callback(

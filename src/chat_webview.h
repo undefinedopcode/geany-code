@@ -72,6 +72,16 @@ void chat_webview_clear(GtkWidget *webview);
 /* Export conversation as markdown string. Caller frees with g_free(). */
 gchar *chat_webview_export_markdown(GtkWidget *webview);
 
+/* Copy the most-recent assistant response's raw content to the clipboard.
+ * Returns TRUE if a response was found and copied. */
+gboolean chat_webview_copy_last_response(GtkWidget *webview);
+
+/* Export conversation as a styled, standalone HTML document. */
+gchar *chat_webview_export_html(GtkWidget *webview);
+
+/* Export conversation as a structured JSON array of entries. */
+gchar *chat_webview_export_json(GtkWidget *webview);
+
 /* Set theme colors from GTK */
 void chat_webview_apply_theme(GtkWidget *webview);
 

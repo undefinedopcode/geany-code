@@ -10,6 +10,7 @@ typedef struct {
     GtkTextBuffer  *buffer;
     GtkWidget      *send_btn;
     GtkWidget      *stop_btn;
+    GtkWidget      *stream_spinner; /* spinning indicator while response streams */
     GtkWidget      *mode_combo;
     GtkWidget      *model_combo;
     GtkWidget      *todos_box;      /* todo panel (above chips, shown when active) */
@@ -21,6 +22,15 @@ typedef struct {
     GList          *commands;       /* GList of CommandInfo structs */
     GList          *project_files;  /* GList of gchar* (relative paths) */
     gchar          *project_root;   /* absolute path to project root */
+    GCancellable   *scan_cancel;    /* cancellable for in-flight @ file scan */
+    guint           completion_refresh_id;  /* debounce timer for completion */
+
+    /* Per-project draft + sent-prompt history persisted to disk. */
+    gchar          *history_path;   /* JSON file backing history + draft */
+    GList          *history;        /* GList of gchar* (oldest → newest) */
+    gint            history_pos;    /* -1 = not browsing, else index in history */
+    gchar          *pending_input;  /* saved buffer content when browsing began */
+    guint           draft_save_id;  /* debounce timer for draft writes */
     GList          *images;         /* GList of gchar* (base64 PNG data) */
     GList          *contexts;       /* GList of ContextChunk* */
     ChatInputSendCb       send_cb;
@@ -41,6 +51,11 @@ static ChatInputPrivate *get_priv(GtkWidget *input)
     return g_object_get_data(G_OBJECT(input), INPUT_PRIV_KEY);
 }
 
+/* Forward declarations for history/draft helpers used by on_send_clicked. */
+static void append_history_entry(ChatInputPrivate *priv, const gchar *text);
+static void persist_history_and_draft(ChatInputPrivate *priv,
+                                       const gchar *draft_text);
+
 /* ── Signal handlers ─────────────────────────────────────────────── */
 
 static void on_send_clicked(GtkButton *btn, gpointer data)
@@ -56,8 +71,21 @@ static void on_send_clicked(GtkButton *btn, gpointer data)
     gchar *text = gtk_text_buffer_get_text(priv->buffer, &start, &end, FALSE);
 
     if (text && strlen(text) > 0) {
+        append_history_entry(priv, text);
+        priv->history_pos = -1;
+        g_free(priv->pending_input);
+        priv->pending_input = NULL;
+
         priv->send_cb(text, priv->send_data);
         gtk_text_buffer_set_text(priv->buffer, "", -1);
+
+        /* Persist immediately so the sent prompt is in history even if
+         * the user quits before the debounce fires. Draft is now empty. */
+        if (priv->draft_save_id) {
+            g_source_remove(priv->draft_save_id);
+            priv->draft_save_id = 0;
+        }
+        persist_history_and_draft(priv, "");
     }
 
     g_free(text);
@@ -479,9 +507,12 @@ static gboolean should_skip_dir(const gchar *name)
 }
 
 static void scan_dir_recursive(const gchar *base, const gchar *rel_prefix,
-                                GList **out, gint depth)
+                                GList **out, gint depth,
+                                GCancellable *cancel)
 {
     if (depth > 8)
+        return;
+    if (g_cancellable_is_cancelled(cancel))
         return;
 
     gchar *full = rel_prefix[0]
@@ -495,6 +526,9 @@ static void scan_dir_recursive(const gchar *base, const gchar *rel_prefix,
 
     const gchar *name;
     while ((name = g_dir_read_name(dir)) != NULL) {
+        if (g_cancellable_is_cancelled(cancel))
+            break;
+
         gchar *rel = rel_prefix[0]
             ? g_build_filename(rel_prefix, name, NULL)
             : g_strdup(name);
@@ -502,7 +536,7 @@ static void scan_dir_recursive(const gchar *base, const gchar *rel_prefix,
 
         if (g_file_test(abs, G_FILE_TEST_IS_DIR)) {
             if (!should_skip_dir(name))
-                scan_dir_recursive(base, rel, out, depth + 1);
+                scan_dir_recursive(base, rel, out, depth + 1, cancel);
         } else {
             *out = g_list_prepend(*out, rel);
             rel = NULL;  /* ownership transferred */
@@ -514,18 +548,75 @@ static void scan_dir_recursive(const gchar *base, const gchar *rel_prefix,
     g_dir_close(dir);
 }
 
-static void scan_project_files(ChatInputPrivate *priv)
+/* Runs on a worker thread. Scans filesystem; returns a GList<gchar*>. */
+static void scan_thread_func(GTask *task, gpointer source,
+                              gpointer task_data, GCancellable *cancel)
 {
+    (void)source;
+    const gchar *root = task_data;
+
+    GList *files = NULL;
+    scan_dir_recursive(root, "", &files, 0, cancel);
+
+    if (g_cancellable_is_cancelled(cancel)) {
+        g_list_free_full(files, g_free);
+        g_task_return_pointer(task, NULL, NULL);
+        return;
+    }
+
+    files = g_list_sort(files, (GCompareFunc)g_strcmp0);
+    g_task_return_pointer(task, files,
+                          (GDestroyNotify)NULL);  /* caller takes ownership */
+}
+
+/* Runs on main thread once the worker finishes. */
+static void scan_done(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    (void)user_data;
+    GtkWidget *vbox = GTK_WIDGET(source);
+    GTask *task = G_TASK(res);
+    GList *files = g_task_propagate_pointer(task, NULL);
+
+    ChatInputPrivate *priv = get_priv(vbox);
+    if (!priv) {
+        /* Widget destroyed while scan was running — discard result. */
+        g_list_free_full(files, g_free);
+        return;
+    }
+
+    /* If a newer scan has superseded this one, discard our result. */
+    GCancellable *task_cancel = g_task_get_cancellable(task);
+    if (task_cancel != priv->scan_cancel) {
+        g_list_free_full(files, g_free);
+        return;
+    }
+
+    g_list_free_full(priv->project_files, g_free);
+    priv->project_files = files;
+    g_clear_object(&priv->scan_cancel);
+    DBG("Scanned %u project files", g_list_length(priv->project_files));
+}
+
+static void scan_project_files(GtkWidget *input, ChatInputPrivate *priv)
+{
+    /* Cancel any in-flight scan; its result will be discarded in scan_done. */
+    if (priv->scan_cancel) {
+        g_cancellable_cancel(priv->scan_cancel);
+        g_clear_object(&priv->scan_cancel);
+    }
+
     g_list_free_full(priv->project_files, g_free);
     priv->project_files = NULL;
 
     if (!priv->project_root)
         return;
 
-    scan_dir_recursive(priv->project_root, "", &priv->project_files, 0);
-    priv->project_files = g_list_sort(priv->project_files,
-                                       (GCompareFunc)g_strcmp0);
-    DBG("Scanned %u project files", g_list_length(priv->project_files));
+    priv->scan_cancel = g_cancellable_new();
+
+    GTask *task = g_task_new(input, priv->scan_cancel, scan_done, NULL);
+    g_task_set_task_data(task, g_strdup(priv->project_root), g_free);
+    g_task_run_in_thread(task, scan_thread_func);
+    g_object_unref(task);
 }
 
 /* Find the @token at or before the cursor. Returns the text after '@',
@@ -717,11 +808,16 @@ static void show_file_menu(ChatInputPrivate *priv, GtkWidget *vbox,
 
     priv->file_menu = gtk_menu_new();
     gint count = 0;
+    gint total_matches = 0;
     const gint MAX_ITEMS = 20;
 
-    for (GList *l = priv->project_files; l && count < MAX_ITEMS; l = l->next) {
+    for (GList *l = priv->project_files; l; l = l->next) {
         const gchar *rel_path = l->data;
         if (!file_matches_prefix(rel_path, prefix))
+            continue;
+
+        total_matches++;
+        if (count >= MAX_ITEMS)
             continue;
 
         GtkWidget *item = gtk_menu_item_new_with_label(rel_path);
@@ -731,6 +827,15 @@ static void show_file_menu(ChatInputPrivate *priv, GtkWidget *vbox,
                          G_CALLBACK(on_file_item_activate), vbox);
         gtk_menu_shell_append(GTK_MENU_SHELL(priv->file_menu), item);
         count++;
+    }
+
+    if (total_matches > MAX_ITEMS) {
+        gchar *more = g_strdup_printf("… and %d more",
+                                       total_matches - MAX_ITEMS);
+        GtkWidget *more_item = gtk_menu_item_new_with_label(more);
+        gtk_widget_set_sensitive(more_item, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(priv->file_menu), more_item);
+        g_free(more);
     }
 
     if (count > 0) {
@@ -745,17 +850,201 @@ static void show_file_menu(ChatInputPrivate *priv, GtkWidget *vbox,
     }
 }
 
-/* ── Buffer change handler (slash + file completion) ─────────────── */
+/* ── Per-project drafts + prompt history ─────────────────────────── */
 
-static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data)
+#define HISTORY_MAX 200
+#define DRAFT_SAVE_DEBOUNCE_MS 600
+
+static gchar *history_file_for_root(const gchar *root)
+{
+    if (!root || !*root) return NULL;
+
+    /* Slug: replace path separators with dashes, same convention used by
+     * the session picker for Claude CLI. */
+    gchar *slug = g_strdup(root);
+    for (gchar *p = slug; *p; p++) {
+        if (*p == '/' || *p == '\\')
+            *p = '-';
+    }
+
+    gchar *dir = g_build_filename(g_get_user_config_dir(), "geany",
+                                   "plugins", "geany-code", "history", NULL);
+    g_mkdir_with_parents(dir, 0700);
+
+    gchar *filename = g_strdup_printf("%s.json", slug);
+    gchar *path = g_build_filename(dir, filename, NULL);
+
+    g_free(slug);
+    g_free(dir);
+    g_free(filename);
+    return path;
+}
+
+static void history_list_free(GList *history)
+{
+    g_list_free_full(history, g_free);
+}
+
+static void priv_clear_history_state(ChatInputPrivate *priv)
+{
+    history_list_free(priv->history);
+    priv->history = NULL;
+    priv->history_pos = -1;
+    g_free(priv->pending_input);
+    priv->pending_input = NULL;
+}
+
+/* Serialize current draft + history to disk. */
+static void persist_history_and_draft(ChatInputPrivate *priv,
+                                       const gchar *draft_text)
+{
+    if (!priv->history_path) return;
+
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+
+    json_builder_set_member_name(b, "draft");
+    json_builder_add_string_value(b, draft_text ? draft_text : "");
+
+    json_builder_set_member_name(b, "history");
+    json_builder_begin_array(b);
+    for (GList *l = priv->history; l; l = l->next)
+        json_builder_add_string_value(b, (const gchar *)l->data);
+    json_builder_end_array(b);
+
+    json_builder_end_object(b);
+
+    JsonGenerator *gen = json_generator_new();
+    json_generator_set_pretty(gen, FALSE);
+    json_generator_set_root(gen, json_builder_get_root(b));
+    gchar *out = json_generator_to_data(gen, NULL);
+    g_object_unref(gen);
+    g_object_unref(b);
+
+    if (out) {
+        g_file_set_contents(priv->history_path, out, -1, NULL);
+        g_free(out);
+    }
+}
+
+/* Load history JSON for the current project_root and populate state. */
+static void load_history_and_draft(GtkWidget *vbox, ChatInputPrivate *priv)
+{
+    priv_clear_history_state(priv);
+
+    if (!priv->history_path) return;
+
+    gchar *contents = NULL;
+    if (!g_file_get_contents(priv->history_path, &contents, NULL, NULL))
+        return;
+
+    JsonParser *jp = json_parser_new();
+    if (!json_parser_load_from_data(jp, contents, -1, NULL)) {
+        g_object_unref(jp);
+        g_free(contents);
+        return;
+    }
+
+    JsonNode *root = json_parser_get_root(jp);
+    if (root && JSON_NODE_HOLDS_OBJECT(root)) {
+        JsonObject *obj = json_node_get_object(root);
+
+        if (json_object_has_member(obj, "history")) {
+            JsonNode *hnode = json_object_get_member(obj, "history");
+            if (hnode && JSON_NODE_HOLDS_ARRAY(hnode)) {
+                JsonArray *arr = json_node_get_array(hnode);
+                guint n = json_array_get_length(arr);
+                for (guint i = 0; i < n; i++) {
+                    const gchar *s = json_array_get_string_element(arr, i);
+                    if (s)
+                        priv->history = g_list_append(priv->history,
+                                                       g_strdup(s));
+                }
+            }
+        }
+
+        if (json_object_has_member(obj, "draft")) {
+            const gchar *d = json_object_get_string_member(obj, "draft");
+            if (d && *d) {
+                /* Only restore a draft if the buffer is currently empty,
+                 * so we don't clobber anything the user just typed. */
+                (void)vbox;
+                GtkTextIter s, e;
+                gtk_text_buffer_get_bounds(priv->buffer, &s, &e);
+                gchar *cur = gtk_text_buffer_get_text(priv->buffer,
+                                                      &s, &e, FALSE);
+                if (!cur || !*cur)
+                    gtk_text_buffer_set_text(priv->buffer, d, -1);
+                g_free(cur);
+            }
+        }
+    }
+    g_object_unref(jp);
+    g_free(contents);
+}
+
+static void append_history_entry(ChatInputPrivate *priv, const gchar *text)
+{
+    if (!text || !*text) return;
+
+    /* Deduplicate against the most-recent entry. */
+    GList *tail = g_list_last(priv->history);
+    if (tail && g_strcmp0((const gchar *)tail->data, text) == 0)
+        return;
+
+    priv->history = g_list_append(priv->history, g_strdup(text));
+
+    /* Trim to HISTORY_MAX entries, dropping oldest. */
+    guint len = g_list_length(priv->history);
+    while (len > HISTORY_MAX) {
+        GList *first = priv->history;
+        priv->history = g_list_remove_link(priv->history, first);
+        g_free(first->data);
+        g_list_free_1(first);
+        len--;
+    }
+}
+
+static gboolean save_draft_timeout(gpointer data)
 {
     GtkWidget *vbox = GTK_WIDGET(data);
     ChatInputPrivate *priv = get_priv(vbox);
-    if (!priv) return;
+    if (!priv) return G_SOURCE_REMOVE;
+
+    priv->draft_save_id = 0;
+    if (!priv->history_path) return G_SOURCE_REMOVE;
+
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(priv->buffer, &s, &e);
+    gchar *text = gtk_text_buffer_get_text(priv->buffer, &s, &e, FALSE);
+    persist_history_and_draft(priv, text);
+    g_free(text);
+    return G_SOURCE_REMOVE;
+}
+
+static void schedule_draft_save(GtkWidget *vbox, ChatInputPrivate *priv)
+{
+    if (!priv->history_path) return;
+    if (priv->draft_save_id)
+        g_source_remove(priv->draft_save_id);
+    priv->draft_save_id = g_timeout_add(
+        DRAFT_SAVE_DEBOUNCE_MS, save_draft_timeout, vbox);
+}
+
+/* ── Buffer change handler (slash + file completion) ─────────────── */
+
+/* Coalesced refresh so rapid typing / key repeat doesn't thrash the menu. */
+static gboolean refresh_completion_menus(gpointer data)
+{
+    GtkWidget *vbox = GTK_WIDGET(data);
+    ChatInputPrivate *priv = get_priv(vbox);
+    if (!priv) return G_SOURCE_REMOVE;
+
+    priv->completion_refresh_id = 0;
 
     GtkTextIter start, end;
-    gtk_text_buffer_get_bounds(buffer, &start, &end);
-    gchar *text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+    gtk_text_buffer_get_bounds(priv->buffer, &start, &end);
+    gchar *text = gtk_text_buffer_get_text(priv->buffer, &start, &end, FALSE);
 
     /* Slash command completion */
     if (priv->commands && text && text[0] == '/' &&
@@ -770,7 +1059,7 @@ static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data)
 
     /* @ file completion */
     gint at_offset = 0;
-    gchar *at_prefix = find_at_token(buffer, &at_offset);
+    gchar *at_prefix = find_at_token(priv->buffer, &at_offset);
     if (at_prefix) {
         show_file_menu(priv, vbox, at_prefix);
         g_free(at_prefix);
@@ -782,18 +1071,127 @@ static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data)
     }
 
     g_free(text);
+    return G_SOURCE_REMOVE;
 }
 
-/* Handle key presses — Enter sends, Shift+Enter newline */
+static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data)
+{
+    (void)buffer;
+    GtkWidget *vbox = GTK_WIDGET(data);
+    ChatInputPrivate *priv = get_priv(vbox);
+    if (!priv) return;
+
+    /* Debounce: reset the timer on every keystroke so we only rebuild the
+     * menu once typing pauses. 30 ms is imperceptible but absorbs key
+     * repeat comfortably (~25 Hz). */
+    if (priv->completion_refresh_id)
+        g_source_remove(priv->completion_refresh_id);
+    priv->completion_refresh_id = g_timeout_add(
+        30, refresh_completion_menus, vbox);
+
+    /* Debounced save-to-disk of the current draft text. */
+    schedule_draft_save(vbox, priv);
+}
+
+/* Replace buffer content with `text` and place the cursor at the end. */
+static void set_buffer_and_move_end(ChatInputPrivate *priv, const gchar *text)
+{
+    gtk_text_buffer_set_text(priv->buffer, text ? text : "", -1);
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(priv->buffer, &end);
+    gtk_text_buffer_place_cursor(priv->buffer, &end);
+}
+
+/* Move one entry older in history. Returns TRUE if we consumed the key. */
+static gboolean history_navigate_back(ChatInputPrivate *priv)
+{
+    if (!priv->history) return FALSE;
+
+    guint len = g_list_length(priv->history);
+    if (priv->history_pos < 0) {
+        /* Entering history mode — save the current draft so we can
+         * return to it with Down past the newest entry. */
+        GtkTextIter s, e;
+        gtk_text_buffer_get_bounds(priv->buffer, &s, &e);
+        g_free(priv->pending_input);
+        priv->pending_input = gtk_text_buffer_get_text(
+            priv->buffer, &s, &e, FALSE);
+        priv->history_pos = (gint)len - 1;
+    } else if (priv->history_pos > 0) {
+        priv->history_pos--;
+    } else {
+        /* Already at the oldest entry — nothing to do. */
+        return TRUE;
+    }
+
+    const gchar *entry = g_list_nth_data(priv->history,
+                                          (guint)priv->history_pos);
+    set_buffer_and_move_end(priv, entry);
+    return TRUE;
+}
+
+/* Move one entry newer (or back to the pending draft). */
+static gboolean history_navigate_forward(ChatInputPrivate *priv)
+{
+    if (priv->history_pos < 0) return FALSE;
+
+    guint len = g_list_length(priv->history);
+    if ((guint)priv->history_pos + 1 < len) {
+        priv->history_pos++;
+        const gchar *entry = g_list_nth_data(priv->history,
+                                              (guint)priv->history_pos);
+        set_buffer_and_move_end(priv, entry);
+    } else {
+        /* Past the newest entry — restore the saved draft and exit
+         * history mode. */
+        priv->history_pos = -1;
+        set_buffer_and_move_end(priv,
+            priv->pending_input ? priv->pending_input : "");
+        g_free(priv->pending_input);
+        priv->pending_input = NULL;
+    }
+    return TRUE;
+}
+
+/* Handle key presses — Enter sends, Shift+Enter newline, Up/Down browse
+ * per-project prompt history when the cursor is at the first/last line. */
 static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event,
                               gpointer data)
 {
     (void)widget;
+    GtkWidget *vbox = GTK_WIDGET(data);
+    ChatInputPrivate *priv = get_priv(vbox);
+
     if ((event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter) &&
         !(event->state & GDK_SHIFT_MASK)) {
         on_send_clicked(NULL, data);
         return TRUE;
     }
+
+    if (!priv) return FALSE;
+
+    /* Any Ctrl/Shift/Alt combo with Up/Down should pass through
+     * untouched (e.g. Shift+Up for selection). Only bare Up/Down
+     * triggers history browsing. */
+    guint mask = event->state & gtk_accelerator_get_default_mod_mask();
+    if (mask != 0) return FALSE;
+
+    if (event->keyval == GDK_KEY_Up) {
+        GtkTextMark *mark = gtk_text_buffer_get_insert(priv->buffer);
+        GtkTextIter cur;
+        gtk_text_buffer_get_iter_at_mark(priv->buffer, &cur, mark);
+        if (gtk_text_iter_get_line(&cur) == 0)
+            return history_navigate_back(priv);
+    } else if (event->keyval == GDK_KEY_Down) {
+        GtkTextMark *mark = gtk_text_buffer_get_insert(priv->buffer);
+        GtkTextIter cur;
+        gtk_text_buffer_get_iter_at_mark(priv->buffer, &cur, mark);
+        gint cur_line = gtk_text_iter_get_line(&cur);
+        gint last_line = gtk_text_buffer_get_line_count(priv->buffer) - 1;
+        if (cur_line == last_line)
+            return history_navigate_forward(priv);
+    }
+
     return FALSE;
 }
 
@@ -849,6 +1247,15 @@ GtkWidget *chat_input_new(void)
     gtk_box_pack_start(GTK_BOX(mode_row), priv->mode_combo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(mode_row), priv->model_combo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(mode_row), gtk_label_new(""), TRUE, TRUE, 0);
+
+    /* Streaming spinner (always packed; only animates while streaming) */
+    priv->stream_spinner = gtk_spinner_new();
+    gtk_widget_set_tooltip_text(priv->stream_spinner,
+                                "Receiving streaming response…");
+    gtk_widget_set_size_request(priv->stream_spinner, 18, 18);
+    gtk_widget_set_valign(priv->stream_spinner, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(mode_row), priv->stream_spinner, FALSE, FALSE, 4);
+
     gtk_box_pack_start(GTK_BOX(vbox), mode_row, FALSE, FALSE, 0);
 
     /* Text input row: [text entry] [stop] [send] */
@@ -1188,6 +1595,19 @@ void chat_input_set_commands(GtkWidget *input, const gchar *commands_json)
     DBG("Loaded %u slash commands", len);
 }
 
+void chat_input_foreach_command(GtkWidget *input,
+                                 ChatInputCommandIterCb cb,
+                                 gpointer user_data)
+{
+    ChatInputPrivate *priv = get_priv(input);
+    if (!priv || !cb) return;
+
+    for (GList *l = priv->commands; l; l = l->next) {
+        CommandInfo *ci = l->data;
+        cb(ci->name, ci->description, user_data);
+    }
+}
+
 void chat_input_set_project_root(GtkWidget *input, const gchar *root)
 {
     ChatInputPrivate *priv = get_priv(input);
@@ -1197,9 +1617,27 @@ void chat_input_set_project_root(GtkWidget *input, const gchar *root)
     if (g_strcmp0(priv->project_root, root) == 0)
         return;
 
+    /* Flush any pending draft save for the outgoing project. */
+    if (priv->draft_save_id) {
+        g_source_remove(priv->draft_save_id);
+        priv->draft_save_id = 0;
+        if (priv->history_path) {
+            GtkTextIter s, e;
+            gtk_text_buffer_get_bounds(priv->buffer, &s, &e);
+            gchar *cur = gtk_text_buffer_get_text(priv->buffer, &s, &e, FALSE);
+            persist_history_and_draft(priv, cur);
+            g_free(cur);
+        }
+    }
+
     g_free(priv->project_root);
     priv->project_root = g_strdup(root);
-    scan_project_files(priv);
+
+    g_free(priv->history_path);
+    priv->history_path = history_file_for_root(root);
+
+    load_history_and_draft(input, priv);
+    scan_project_files(input, priv);
 }
 
 void chat_input_set_models(GtkWidget *input, const gchar *models_json)
@@ -1265,6 +1703,20 @@ void chat_input_set_busy(GtkWidget *input, gboolean busy)
 
     gtk_widget_set_sensitive(priv->send_btn, !busy);
     gtk_widget_set_sensitive(priv->stop_btn, busy);
+}
+
+void chat_input_set_streaming(GtkWidget *input, gboolean streaming)
+{
+    ChatInputPrivate *priv = get_priv(input);
+    if (!priv || !priv->stream_spinner) return;
+
+    if (streaming) {
+        gtk_spinner_start(GTK_SPINNER(priv->stream_spinner));
+        gtk_widget_show(priv->stream_spinner);
+    } else {
+        gtk_spinner_stop(GTK_SPINNER(priv->stream_spinner));
+        gtk_widget_hide(priv->stream_spinner);
+    }
 }
 
 void chat_input_set_send_callback(GtkWidget *input, ChatInputSendCb cb,

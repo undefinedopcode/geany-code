@@ -34,4 +34,10 @@ void chat_widget_show_user_question(GtkWidget *widget,
 /* Add current selection as a context chunk */
 void chat_widget_add_context_from_editor(GtkWidget *widget);
 
+/* Open the command palette (Ctrl+Shift+P by default) */
+void chat_widget_show_command_palette(GtkWidget *widget);
+
+/* Copy the most recent assistant response to the clipboard. */
+gboolean chat_widget_copy_last_response(GtkWidget *widget);
+
 #endif /* GEANY_CODE_CHAT_WIDGET_H */
